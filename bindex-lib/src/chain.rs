@@ -150,6 +150,14 @@ impl IndexedChain {
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
                 .max_response_header_size(usize::MAX) // Disabled as a workaround
+                // Blocks are fetched in parallel via rayon (one request per worker
+                // thread). ureq's default idle pool (per_host=3) is far below the
+                // thread count, so most connections are closed instead of reused —
+                // on a fast localhost node that churns through the ephemeral port
+                // range and fails with EADDRNOTAVAIL. Keep enough idle connections
+                // pooled to cover the rayon pool so connections are reused.
+                .max_idle_connections(256)
+                .max_idle_connections_per_host(256)
                 .build(),
         );
         let client = client::Client::new(agent, config.url);

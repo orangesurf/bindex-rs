@@ -52,6 +52,9 @@ impl Client {
             match &err {
                 ureq::Error::StatusCode(503) => (),
                 ureq::Error::Io(e) if e.kind() == ErrorKind::ConnectionRefused => (),
+                // Transient local ephemeral-port exhaustion under heavy parallel
+                // fetching (EADDRNOTAVAIL): back off and retry rather than abort.
+                ureq::Error::Io(e) if e.kind() == ErrorKind::AddrNotAvailable => (),
                 _ => break err, // non-retriable error
             }
             warn!("unavailable {}: {:?}", url, err);
