@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bindex · monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0f1115; --panel:#ffffff; --panel-soft:#f6f7f9; --line:#e5e7eb;
+    --text:#16181d; --muted:#68707d; --blue:#1769e0; --green:#1f9d55; --red:#d9382e;
+    --amber:#b7791f; --shadow:0 10px 32px rgba(0,0,0,.12);
+  }
+  *{box-sizing:border-box}
+  body{margin:0; min-height:100vh; padding:32px 20px 56px; font-family:'DM Sans',system-ui,sans-serif; background:#eef1f5; color:var(--text)}
+  .wrap{max-width:1180px; margin:0 auto; display:flex; flex-direction:column; gap:14px}
+  header{display:flex; justify-content:space-between; align-items:flex-end; gap:16px}
+  h1{font-size:28px; margin:0; letter-spacing:0; line-height:1.1}
+  .sub{margin-top:4px; color:var(--muted); font-size:13px}
+  a{color:var(--blue); text-decoration:none; font-weight:600}
+  .actions{display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:flex-end}
+  button{border:1px solid #cbd5e1; background:#fff; color:var(--text); border-radius:6px; min-height:36px; padding:0 12px; font:600 13px 'DM Sans',system-ui,sans-serif; cursor:pointer}
+  button:hover{border-color:#94a3b8; background:#f8fafc}
+  button:disabled{cursor:default; opacity:.55}
+  .grid{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px}
+  .wide{grid-column:1 / -1}
+  .span2{grid-column:span 2}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:8px; box-shadow:var(--shadow); padding:16px}
+  .label{color:var(--muted); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.5px}
+  .value{font-size:24px; font-weight:700; margin-top:3px}
+  .mono{font-family:'DM Mono',monospace}
+  .small{font-size:12px; color:var(--muted)}
+  .ok{color:var(--green)} .bad{color:var(--red)} .warn{color:var(--amber)}
+  table{width:100%; border-collapse:collapse; font-size:13px}
+  th{text-align:left; padding:8px 8px; border-bottom:1px solid var(--line); color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.4px}
+  td{padding:8px; border-bottom:1px solid #f0f1f3; vertical-align:top}
+  td.num{text-align:right; font-family:'DM Mono',monospace; white-space:nowrap}
+  .target{max-width:520px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .pill{display:inline-block; min-width:54px; text-align:center; padding:3px 8px; border-radius:999px; background:var(--panel-soft); font-size:11px; font-weight:700}
+  .statusline{font-size:12px; color:var(--muted)}
+  @media(max-width:860px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.span2{grid-column:1 / -1}}
+  @media(max-width:560px){body{padding:20px 12px}.grid{grid-template-columns:1fr}header{align-items:flex-start; flex-direction:column}.target{max-width:220px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>bindex monitor</h1>
+      <div class="sub">Electrum client traffic, index sync state, and query response times.</div>
+    </div>
+    <div class="actions">
+      <span class="statusline" id="resetStatus"></span>
+      <button id="resetButton" type="button">Reset stats</button>
+      <a href="/">Search</a>
+    </div>
+  </header>
+
+  <section class="grid">
+    <div class="card"><div class="label">Tip height</div><div class="value" id="tip">…</div><div class="small mono" id="tipHash">…</div></div>
+    <div class="card"><div class="label">Uptime</div><div class="value" id="uptime">…</div><div class="small">process lifetime</div></div>
+    <div class="card"><div class="label">Sync</div><div class="value" id="syncState">…</div><div class="small" id="syncDetail">…</div></div>
+    <div class="card"><div class="label">Workers</div><div class="value" id="workers">…</div><div class="small">HTTP worker threads</div></div>
+
+    <div class="card"><div class="label">Electrum</div><div class="value" id="electrumState">…</div><div class="small" id="electrumUpdated">…</div></div>
+    <div class="card"><div class="label">Active clients</div><div class="value" id="electrumActive">…</div><div class="small">connected TCP sessions</div></div>
+    <div class="card"><div class="label">Electrum requests</div><div class="value" id="electrumRequests">…</div><div class="small">total JSON-RPC calls</div></div>
+    <div class="card"><div class="label">Electrum errors</div><div class="value" id="electrumErrors">…</div><div class="small">server and protocol errors</div></div>
+
+    <div class="card span2">
+      <div class="label">Electrum method latency</div>
+      <table>
+        <thead><tr><th>method</th><th class="num">count</th><th class="num">errors</th><th class="num">avg</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th></tr></thead>
+        <tbody id="electrumMethods"><tr><td colspan="7" class="small">loading</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card span2">
+      <div class="label">Connected clients</div>
+      <table>
+        <thead><tr><th>peer</th><th class="num">requests</th><th class="num">errors</th><th>last method</th><th>last seen</th></tr></thead>
+        <tbody id="electrumClients"><tr><td colspan="5" class="small">loading</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card wide">
+      <div class="label">Recent Electrum requests</div>
+      <table>
+        <thead><tr><th>time</th><th>peer</th><th>method</th><th class="num">duration</th><th>status</th></tr></thead>
+        <tbody id="electrumRecent"><tr><td colspan="5" class="small">loading</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card span2">
+      <div class="label">Web route latency</div>
+      <table>
+        <thead><tr><th>route</th><th class="num">count</th><th class="num">errors</th><th class="num">avg</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th></tr></thead>
+        <tbody id="routes"><tr><td colspan="7" class="small">loading</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card span2">
+      <div class="label">Sync totals</div>
+      <div id="syncRows"></div>
+    </div>
+
+    <div class="card wide">
+      <div class="label">Recent web requests</div>
+      <table>
+        <thead><tr><th>time</th><th>route</th><th>target</th><th class="num">duration</th><th>status</th></tr></thead>
+        <tbody id="recent"><tr><td colspan="5" class="small">loading</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+const fmtMs = n => (Number(n)||0).toFixed((Number(n)||0) >= 100 ? 0 : 1) + ' ms';
+const fmtBytes = n => {
+  n = Number(n)||0;
+  for (const unit of ['B','KB','MB','GB','TB']) {
+    if (n < 1024 || unit === 'TB') return n.toFixed(unit === 'B' ? 0 : 1) + ' ' + unit;
+    n /= 1024;
+  }
+};
+// Must escape quotes: esc() output lands in title="${...}", and peer/last_method
+// come straight off the wire from any client that connects to the Electrum port.
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const clock = ts => ts ? new Date(ts*1000).toLocaleTimeString() : 'never';
+const age = secs => {
+  secs = Number(secs)||0;
+  const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60), s = secs%60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
+};
+function row(k,v){ return `<div style="display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid #f0f1f3"><span class="small">${esc(k)}</span><span class="mono">${esc(v)}</span></div>`; }
+
+async function resetStats(){
+  const button = document.getElementById('resetButton');
+  const status = document.getElementById('resetStatus');
+  button.disabled = true;
+  status.textContent = 'resetting…';
+  try {
+    const response = await fetch('/api/monitor/reset', { method: 'POST' });
+    const json = await response.json();
+    if (!response.ok || !json.ok) throw new Error(json.error || `HTTP ${response.status}`);
+    status.textContent = 'reset';
+    await refresh();
+  } catch (err) {
+    status.textContent = err.message || 'reset failed';
+  } finally {
+    button.disabled = false;
+    setTimeout(() => {
+      if (status.textContent === 'reset') status.textContent = '';
+    }, 2200);
+  }
+}
+
+async function refresh(){
+  const d = await (await fetch('/api/monitor')).json();
+  document.getElementById('tip').textContent = d.chain.tip_height ?? '?';
+  document.getElementById('tipHash').textContent = d.chain.tip_hash ?? d.chain.error ?? 'unknown';
+  document.getElementById('uptime').textContent = age(d.uptime_secs);
+  document.getElementById('workers').textContent = d.workers;
+  document.getElementById('syncState').innerHTML = d.sync.last_error ? '<span class="bad">Error</span>' : '<span class="ok">OK</span>';
+  document.getElementById('syncDetail').textContent = `last finish ${clock(d.sync.last_finished_at)}`;
+  document.getElementById('syncRows').innerHTML = [
+    row('runs', d.sync.runs),
+    row('indexed blocks', d.sync.indexed_blocks),
+    row('bytes read', fmtBytes(d.sync.bytes_read)),
+    row('last indexed', d.sync.last_indexed_blocks ?? 0),
+    row('last elapsed', fmtMs(d.sync.last_elapsed_ms)),
+    row('last tip', d.sync.last_tip ?? 'unknown'),
+    row('last error', d.sync.last_error ?? 'none'),
+  ].join('');
+
+  const e = d.electrum || {};
+  document.getElementById('electrumState').innerHTML = e.ok ? '<span class="ok">OK</span>' : '<span class="bad">Down</span>';
+  document.getElementById('electrumUpdated').textContent = e.ok ? `updated ${clock(e.updated_at)}` : (e.error || 'unavailable');
+  document.getElementById('electrumActive').textContent = e.active_sessions ?? 0;
+  document.getElementById('electrumRequests').textContent = e.total_requests ?? 0;
+  document.getElementById('electrumErrors').textContent = e.total_errors ?? 0;
+
+  document.getElementById('electrumMethods').innerHTML = (e.methods || []).map(m => `<tr>
+    <td class="mono">${esc(m.method)}</td>
+    <td class="num">${m.count}</td>
+    <td class="num ${m.errors ? 'bad' : ''}">${m.errors}</td>
+    <td class="num">${fmtMs(m.avg_ms)}</td>
+    <td class="num">${fmtMs(m.p50_ms)}</td>
+    <td class="num">${fmtMs(m.p95_ms)}</td>
+    <td class="num">${fmtMs(m.max_ms)}</td>
+  </tr>`).join('') || '<tr><td colspan="7" class="small">no Electrum traffic yet</td></tr>';
+
+  document.getElementById('electrumClients').innerHTML = (e.clients || []).map(c => `<tr>
+    <td class="mono target" title="${esc(c.peer)}">${esc(c.peer)}</td>
+    <td class="num">${c.requests}</td>
+    <td class="num ${c.errors ? 'bad' : ''}">${c.errors}</td>
+    <td class="mono target" title="${esc(c.last_method || '')}">${esc(c.last_method || 'none')}</td>
+    <td class="mono">${clock(c.last_seen_at)}</td>
+  </tr>`).join('') || '<tr><td colspan="5" class="small">no connected clients</td></tr>';
+
+  document.getElementById('electrumRecent').innerHTML = (e.recent || []).slice(0, 100).map(r => `<tr>
+    <td class="mono">${clock(r.time)}</td>
+    <td class="target mono" title="${esc(r.peer)}">${esc(r.peer)}</td>
+    <td class="target mono" title="${esc(r.method)}">${esc(r.method)}</td>
+    <td class="num">${fmtMs(r.duration_ms)}</td>
+    <td class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'ok' : esc(r.error || 'error')}</td>
+  </tr>`).join('') || '<tr><td colspan="5" class="small">no Electrum requests yet</td></tr>';
+
+  document.getElementById('routes').innerHTML = (d.routes || []).map(r => `<tr>
+    <td><span class="pill">${esc(r.route)}</span></td>
+    <td class="num">${r.count}</td>
+    <td class="num ${r.errors ? 'bad' : ''}">${r.errors}</td>
+    <td class="num">${fmtMs(r.avg_ms)}</td>
+    <td class="num">${fmtMs(r.p50_ms)}</td>
+    <td class="num">${fmtMs(r.p95_ms)}</td>
+    <td class="num">${fmtMs(r.max_ms)}</td>
+  </tr>`).join('') || '<tr><td colspan="7" class="small">no traffic yet</td></tr>';
+
+  document.getElementById('recent').innerHTML = (d.recent || []).slice(0, 80).map(r => `<tr>
+    <td class="mono">${clock(r.time)}</td>
+    <td><span class="pill">${esc(r.route)}</span></td>
+    <td class="target mono" title="${esc(r.target)}">${esc(r.target)}</td>
+    <td class="num">${fmtMs(r.duration_ms)}</td>
+    <td class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'ok' : esc(r.error || 'error')}</td>
+  </tr>`).join('') || '<tr><td colspan="5" class="small">no requests yet</td></tr>';
+}
+
+document.getElementById('resetButton').addEventListener('click', () => resetStats().catch(console.error));
+refresh().catch(console.error);
+setInterval(() => refresh().catch(console.error), 5000);
+</script>
+</body>
+</html>

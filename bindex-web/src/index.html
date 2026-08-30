@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bindex · address &amp; tx search</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --card-surface: rgba(255,255,255,0.95);
+    --surface-muted:#F5F5F7;
+    --text-primary:#1D1D1F; --text-secondary:#6E6E73;
+    --badge-fill:#E8E8ED; --action-blue:#0071E3;
+    --destructive:#FF3B30; --success:#34C759;
+    --r-card:20px; --r-inner:14px; --r-button:10px; --r-badge:8px; --r-pill:100px;
+    --shadow-card:0 8px 40px rgba(0,0,0,.08),0 1px 3px rgba(0,0,0,.04);
+    --shadow-elevated:0 16px 60px rgba(0,0,0,.12),0 2px 6px rgba(0,0,0,.04);
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; min-height:100vh; padding:48px 20px 80px;
+    font-family:'DM Sans',system-ui,sans-serif; color:var(--text-primary);
+    background:
+      radial-gradient(ellipse at 20% 50%, #f7a58e 0%, transparent 50%),
+      radial-gradient(ellipse at 80% 20%, #7b8cde 0%, transparent 50%),
+      radial-gradient(ellipse at 60% 80%, #d45dbf 0%, transparent 50%),
+      radial-gradient(ellipse at 30% 80%, #5ec4b6 0%, transparent 50%),
+      linear-gradient(135deg, #2a1b3d 0%, #1a1a2e 100%);
+    background-attachment:fixed;
+  }
+  .wrap{max-width:720px; margin:0 auto; display:flex; flex-direction:column; gap:16px;}
+  .hero{text-align:center; color:#fff; margin-bottom:8px;}
+  .hero h1{font-size:40px; font-weight:700; margin:0; letter-spacing:-0.5px;}
+  .hero p{margin:6px 0 0; opacity:.85; font-size:14px;}
+  .hero .tip{font-family:'DM Mono',monospace; font-size:12px; opacity:.7;}
+  .nav{display:flex; justify-content:center; gap:14px; margin-top:10px; font-size:13px;}
+  .nav a{color:#fff; opacity:.86; text-decoration:none; font-weight:600;}
+  .nav a:hover{opacity:1; text-decoration:underline;}
+  .card{
+    background:var(--card-surface); border-radius:var(--r-card);
+    backdrop-filter:blur(40px); -webkit-backdrop-filter:blur(40px);
+    box-shadow:var(--shadow-card); padding:24px 26px;
+  }
+  form{display:flex; gap:8px;}
+  input[type=text]{
+    flex:1; font-family:'DM Mono',monospace; font-size:14px;
+    padding:13px 16px; border:none; border-radius:var(--r-button);
+    background:var(--surface-muted); color:var(--text-primary); outline:none;
+  }
+  input[type=text]:focus{box-shadow:0 0 0 2px var(--action-blue) inset;}
+  button{
+    font-family:inherit; font-size:14px; font-weight:600; cursor:pointer;
+    padding:13px 22px; border:none; border-radius:var(--r-button);
+    background:var(--action-blue); color:#fff; transition:opacity .15s;
+  }
+  button:hover{opacity:.88;}
+  .muted{color:var(--text-secondary);}
+  .kind-badge{
+    display:inline-block; padding:4px 12px; border-radius:var(--r-pill);
+    background:var(--badge-fill); font-size:12px; font-weight:600;
+    text-transform:uppercase; letter-spacing:.4px; margin-bottom:14px;
+  }
+  .mono{font-family:'DM Mono',monospace;}
+  .break{word-break:break-all;}
+  .stat-row{display:flex; flex-wrap:wrap; gap:24px; margin:4px 0 8px;}
+  .stat .label{font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-secondary);}
+  .stat .value{font-size:22px; font-weight:700; margin-top:2px;}
+  table{width:100%; border-collapse:collapse; margin-top:14px; font-size:13px;}
+  th{text-align:left; padding:8px 10px; color:var(--text-secondary); font-weight:600;
+     text-transform:uppercase; font-size:11px; letter-spacing:.4px; border-bottom:1px solid #ECECEF;}
+  td{padding:9px 10px; border-bottom:1px solid #F2F2F4; vertical-align:top;}
+  td.num{text-align:right; font-family:'DM Mono',monospace; white-space:nowrap;}
+  .pos{color:var(--success);} .neg{color:var(--destructive);}
+  .txid{font-family:'DM Mono',monospace; color:var(--action-blue); cursor:pointer;}
+  .txid:hover{text-decoration:underline;}
+  .row{display:flex; justify-content:space-between; gap:12px; padding:7px 0; border-bottom:1px solid #F2F2F4;}
+  .row:last-child{border-bottom:none;}
+  .row .k{color:var(--text-secondary); font-size:13px;}
+  .row .v{font-family:'DM Mono',monospace; font-size:13px; text-align:right; word-break:break-all;}
+  .err{color:var(--destructive); font-weight:500;}
+  .spin{color:var(--text-secondary);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>₿index search</h1>
+    <p>Address history &amp; transaction lookup, served straight from the local index.</p>
+    <p class="tip" id="tip">tip: …</p>
+    <div class="nav"><a href="/monitor">Monitor</a></div>
+  </div>
+
+  <div class="card">
+    <form id="f" autocomplete="off">
+      <input type="text" id="q" placeholder="bitcoin address  or  txid (64 hex chars)" spellcheck="false" autofocus>
+      <button type="submit">Search</button>
+    </form>
+  </div>
+
+  <div id="out"></div>
+</div>
+
+<script>
+const out = document.getElementById('out');
+const qEl = document.getElementById('q');
+
+async function refreshTip(){
+  try{ const s = await (await fetch('/api/status')).json();
+    document.getElementById('tip').textContent = 'tip: block ' + (s.tip_height ?? '?'); }catch{}
+}
+refreshTip(); setInterval(refreshTip, 30000);
+
+// Safe in text and in attributes. Never interpolate into an on*= handler even so:
+// the HTML parser un-escapes the attribute before JS parses it, so &#39; becomes a
+// live quote again. Pass the value via data-* and read it back inside the handler.
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtTime(t){ return new Date(t*1000).toISOString().replace('T',' ').replace('.000Z',' UTC'); }
+
+function searchFor(v){ qEl.value = v; run(); }
+
+async function run(push){
+  const q = qEl.value.trim();
+  if(!q){ return; }
+  if(push !== false){ history.replaceState(null, '', '?q=' + encodeURIComponent(q)); }
+  const isTx = /^[0-9a-fA-F]{64}$/.test(q);
+  const url = (isTx ? '/api/tx/' : '/api/address/') + encodeURIComponent(q);
+  out.innerHTML = '<div class="card spin">Searching the index…</div>';
+  try{
+    const d = await (await fetch(url)).json();
+    if(!d.ok){ out.innerHTML = '<div class="card"><span class="err">'+esc(d.error||'not found')+'</span></div>'; return; }
+    out.innerHTML = d.kind === 'tx' ? renderTx(d) : renderAddress(d);
+  }catch(e){
+    out.innerHTML = '<div class="card"><span class="err">request failed: '+esc(e.message)+'</span></div>';
+  }
+}
+
+function renderAddress(d){
+  let rows = d.txs.map(t => {
+    const cls = t.delta_sat >= 0 ? 'pos' : 'neg';
+    return `<tr>
+      <td><span class="txid" data-txid="${esc(t.txid)}" onclick="searchFor(this.dataset.txid)">${esc(t.txid.slice(0,16))}…</span></td>
+      <td class="num">${t.height}</td>
+      <td class="num muted">${esc(fmtTime(t.time))}</td>
+      <td class="num ${cls}">${esc(t.delta_btc)}</td>
+      <td class="num">${esc(t.balance_btc)}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="card">
+    <span class="kind-badge">Address</span>
+    <div class="mono break muted" style="font-size:13px;margin-bottom:14px">${esc(d.address)}</div>
+    <div class="stat-row">
+      <div class="stat"><div class="label">Balance</div><div class="value">${esc(d.balance_btc)} <span class="muted" style="font-size:14px">BTC</span></div></div>
+      <div class="stat"><div class="label">Received</div><div class="value">${esc(d.total_received_btc)}</div></div>
+      <div class="stat"><div class="label">Transactions</div><div class="value">${d.tx_count}</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>txid</th><th style="text-align:right">height</th><th style="text-align:right">time</th><th style="text-align:right">amount</th><th style="text-align:right">balance</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" class="muted">no history</td></tr>'}</tbody>
+    </table>
+  </div>`;
+}
+
+function renderTx(d){
+  const outs = d.outputs.map(o => `<div class="row"><span class="v break">${esc(o.address)}</span><span class="v">${esc(o.value_btc)}</span></div>`).join('');
+  const r = (k,v) => `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+  return `<div class="card">
+    <span class="kind-badge">Transaction</span>
+    <div class="mono break" style="font-size:13px;margin-bottom:14px">${esc(d.txid)}</div>
+    <div class="stat-row">
+      <div class="stat"><div class="label">Total out</div><div class="value">${esc(d.total_out_btc)} <span class="muted" style="font-size:14px">BTC</span></div></div>
+      <div class="stat"><div class="label">Block</div><div class="value">${d.height}</div></div>
+    </div>
+    ${r('block hash', '<span class="break">'+esc(d.block_hash)+'</span>')}
+    ${r('inputs / outputs', d.input_count + ' / ' + d.output_count)}
+    ${r('size / weight', d.size + ' B / ' + d.weight + ' WU')}
+    ${r('version / locktime', d.version + ' / ' + d.lock_time)}
+    ${r('coinbase', d.is_coinbase ? 'yes' : 'no')}
+  </div>
+  <div class="card">
+    <span class="kind-badge">Outputs (${d.output_count})</span>
+    ${outs}
+  </div>`;
+}
+
+document.getElementById('f').addEventListener('submit', e => { e.preventDefault(); run(); });
+
+// Support shareable /?q=<address-or-txid> links (also lets the page deep-link a search).
+const q0 = new URLSearchParams(location.search).get('q');
+if(q0){ qEl.value = q0; run(false); }
+</script>
+</body>
+</html>
