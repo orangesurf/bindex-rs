@@ -1,0 +1,180 @@
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
+
+use bitcoin::Network;
+use clap::Parser;
+
+use crate::{protocol::ProtocolVersion, torpush};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BroadcastVia {
+    /// POST the raw tx through the tor SOCKS5 proxy to an onion push endpoint,
+    /// on a fresh circuit per push (unique SOCKS credentials + IsolateSOCKSAuth)
+    Tor,
+    /// sendrawtransaction on the bitcoind RPC
+    Bitcoind,
+}
+
+#[derive(Debug, Clone, Parser)]
+#[command(name = "bindex-electrum")]
+#[command(about = "Electrum protocol server backed by bindex")]
+pub struct Config {
+    #[arg(long, default_value = "bitcoin")]
+    pub network: Network,
+
+    #[arg(long)]
+    pub bindex_db_path: PathBuf,
+
+    #[arg(long, default_value = "http://127.0.0.1:8332")]
+    pub bitcoind_rest_url: String,
+
+    #[arg(long, default_value = "http://127.0.0.1:8332")]
+    pub bitcoind_rpc_url: String,
+
+    #[arg(long)]
+    pub bitcoind_rpc_user: Option<String>,
+
+    #[arg(long)]
+    pub bitcoind_rpc_password: Option<String>,
+
+    #[arg(long)]
+    pub bitcoind_rpc_cookie: Option<PathBuf>,
+
+    #[arg(long)]
+    pub bitcoind_rpc_conf: Option<PathBuf>,
+
+    #[arg(long, default_value = "127.0.0.1:50001")]
+    pub tcp_listen: SocketAddr,
+
+    #[arg(long)]
+    pub tls_listen: Option<SocketAddr>,
+
+    #[arg(long)]
+    pub tls_cert: Option<PathBuf>,
+
+    #[arg(long)]
+    pub tls_key: Option<PathBuf>,
+
+    #[arg(long)]
+    pub advertised_host: Vec<String>,
+
+    #[arg(long)]
+    pub cache_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub monitor_path: Option<PathBuf>,
+
+    #[arg(long, default_value = "1.4")]
+    pub protocol_min: ProtocolVersion,
+
+    #[arg(long, default_value = "1.6")]
+    pub protocol_max: ProtocolVersion,
+
+    #[arg(long, default_value_t = 5)]
+    pub mempool_poll_secs: u64,
+
+    #[arg(long, default_value_t = 30_000)]
+    pub secondary_refresh_ms: u64,
+
+    #[arg(long)]
+    pub zmq_rawtx: Option<String>,
+
+    #[arg(long)]
+    pub zmq_rawblock: Option<String>,
+
+    #[arg(long, default_value_t = 100)]
+    pub max_batch_size: usize,
+
+    #[arg(long, default_value_t = 1000)]
+    pub max_subscriptions_per_session: usize,
+
+    /// How blockchain.transaction.broadcast submits transactions
+    #[arg(long, value_enum, default_value_t = BroadcastVia::Tor)]
+    pub broadcast_via: BroadcastVia,
+
+    /// SOCKS5 address of the local tor daemon
+    #[arg(long, default_value = "127.0.0.1:9050")]
+    pub tor_proxy: SocketAddr,
+
+    /// Push endpoint URL; defaults to mempool.space's onion endpoint for --network
+    #[arg(long)]
+    pub tor_broadcast_url: Option<String>,
+
+    #[arg(long, default_value = "bindex electrum")]
+    pub banner: String,
+
+    #[arg(long)]
+    pub peer: Vec<String>,
+
+    #[arg(long)]
+    pub donation_address: Option<String>,
+}
+
+impl Config {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.protocol_min > self.protocol_max {
+            anyhow::bail!("protocol-min must be <= protocol-max");
+        }
+        if self.tls_listen.is_some() && (self.tls_cert.is_none() || self.tls_key.is_none()) {
+            anyhow::bail!("tls-listen requires tls-cert and tls-key");
+        }
+        if self.bitcoind_rpc_user.is_some() ^ self.bitcoind_rpc_password.is_some() {
+            anyhow::bail!("bitcoind-rpc-user and bitcoind-rpc-password must be provided together");
+        }
+        if self.bitcoind_rpc_cookie.is_some() && self.bitcoind_rpc_conf.is_some() {
+            anyhow::bail!("only one of bitcoind-rpc-cookie or bitcoind-rpc-conf can be provided");
+        }
+        if self.max_batch_size == 0 {
+            anyhow::bail!("max-batch-size must be positive");
+        }
+        if self.max_subscriptions_per_session == 0 {
+            anyhow::bail!("max-subscriptions-per-session must be positive");
+        }
+        if self.secondary_refresh_ms == 0 {
+            anyhow::bail!("secondary-refresh-ms must be positive");
+        }
+        if self.broadcast_via == BroadcastVia::Tor {
+            self.tor_broadcast_target()?;
+        }
+        Ok(())
+    }
+
+    pub fn tor_broadcast_target(&self) -> anyhow::Result<torpush::PushTarget> {
+        let url = match &self.tor_broadcast_url {
+            Some(url) => url.clone(),
+            None => {
+                let prefix = match self.network {
+                    Network::Bitcoin => "",
+                    Network::Testnet => "/testnet",
+                    Network::Testnet4 => "/testnet4",
+                    Network::Signet => "/signet",
+                    network => anyhow::bail!(
+                        "no default onion push endpoint for {network}; \
+                         pass --tor-broadcast-url or --broadcast-via bitcoind"
+                    ),
+                };
+                format!("http://{}{prefix}/api/tx", torpush::MEMPOOL_SPACE_ONION)
+            }
+        };
+        Ok(torpush::PushTarget::parse(&url)?)
+    }
+
+    pub fn mempool_poll_interval(&self) -> Duration {
+        Duration::from_secs(self.mempool_poll_secs)
+    }
+
+    pub fn secondary_refresh_interval(&self) -> Duration {
+        Duration::from_millis(self.secondary_refresh_ms)
+    }
+
+    pub fn cache_path(&self) -> PathBuf {
+        self.cache_path
+            .clone()
+            .unwrap_or_else(|| self.bindex_db_path.join("electrum-cache.sqlite3"))
+    }
+
+    pub fn monitor_path(&self) -> PathBuf {
+        self.monitor_path
+            .clone()
+            .unwrap_or_else(|| self.bindex_db_path.join("electrum-monitor.json"))
+    }
+}
