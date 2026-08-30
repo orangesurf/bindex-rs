@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use bitcoin::BlockHash;
 use bitcoin::{hashes::Hash, Network};
+use bitcoin::{BlockHash, Txid};
 use log::*;
 
 use crate::{client, db, headers, index, Location};
@@ -20,6 +20,9 @@ pub enum Error {
 
     #[error("indexing failed: {0:?}")]
     Index(#[from] index::Error),
+
+    #[error("decoding failed: {0}")]
+    Decode(#[from] bitcoin::consensus::encode::Error),
 
     #[error("RocksDB failed: {0}")]
     RocksDB(#[from] rust_rocksdb::Error),
@@ -62,8 +65,9 @@ pub struct IndexedChain {
 
 #[derive(Debug)]
 pub struct Config {
-    db_path: PathBuf,
-    url: String,
+    pub db_path: PathBuf,
+    pub url: String,
+    pub secondary_path: Option<PathBuf>,
 }
 
 struct HeaderChunk {
@@ -142,10 +146,41 @@ impl IndexedChain {
     pub fn open(db_dir: impl AsRef<Path>, network: Network) -> Result<Self, Error> {
         let db_path = db_dir.as_ref().to_path_buf().join(network.to_string());
         let url = format!("http://localhost:{}", default_rpc_port(network));
-        Self::from_config(Config { db_path, url })
+        Self::from_config(Config {
+            db_path,
+            url,
+            secondary_path: None,
+        })
     }
 
-    fn from_config(config: Config) -> Result<Self, Error> {
+    pub fn open_with_rest_url(
+        db_dir: impl AsRef<Path>,
+        network: Network,
+        rest_url: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let db_path = db_dir.as_ref().to_path_buf().join(network.to_string());
+        Self::from_config(Config {
+            db_path,
+            url: rest_url.into(),
+            secondary_path: None,
+        })
+    }
+
+    pub fn open_secondary_with_rest_url(
+        db_dir: impl AsRef<Path>,
+        network: Network,
+        rest_url: impl Into<String>,
+        secondary_path: impl AsRef<Path>,
+    ) -> Result<Self, Error> {
+        let db_path = db_dir.as_ref().to_path_buf().join(network.to_string());
+        Self::from_config(Config {
+            db_path,
+            url: rest_url.into(),
+            secondary_path: Some(secondary_path.as_ref().to_path_buf()),
+        })
+    }
+
+    pub fn from_config(config: Config) -> Result<Self, Error> {
         info!("index: {:?}", config);
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
@@ -183,7 +218,10 @@ impl IndexedChain {
             res => assert_eq!(index::BlockBytes::new(res?), genesis_block),
         };
 
-        let store = db::DB::open(config.db_path)?;
+        let store = match config.secondary_path.as_ref() {
+            Some(secondary_path) => db::DB::open_as_secondary(&config.db_path, secondary_path)?,
+            None => db::DB::open(&config.db_path)?,
+        };
         let headers = headers::Headers::new(store.headers()?);
         if let Some(indexed_genesis) = headers.genesis() {
             if indexed_genesis.hash() != genesis_hash {
@@ -201,6 +239,12 @@ impl IndexedChain {
             client,
             store,
         })
+    }
+
+    pub fn refresh_secondary(&mut self) -> Result<(), Error> {
+        self.store.catch_up_with_primary()?;
+        self.headers = headers::Headers::new(self.store.headers()?);
+        Ok(())
     }
 
     fn drop_tip(&mut self) -> Result<bitcoin::BlockHash, Error> {
@@ -357,6 +401,41 @@ impl IndexedChain {
             .get_block_part(location.indexed_header.hash(), pos)?)
     }
 
+    /// Return the active-chain transaction ids in block order for a height.
+    pub fn block_txids_at_height(&self, height: usize) -> Result<Option<Vec<Txid>>, Error> {
+        let Some(header) = self.headers.header_at_height(height) else {
+            return Ok(None);
+        };
+        let mut txnum = self
+            .headers
+            .header_at_height(height.saturating_sub(1))
+            .filter(|_| height > 0)
+            .map_or_else(index::TxNum::default, index::IndexedHeader::next_txnum);
+        let txs_count = header
+            .next_txnum()
+            .offset_from(txnum)
+            .expect("invalid indexed header txnum range");
+        let mut txids = Vec::with_capacity(txs_count as usize);
+        for _ in 0..txs_count {
+            let location = self.headers.find_by_txnum(txnum);
+            let raw = self.get_tx_bytes(&location)?;
+            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)?;
+            txids.push(tx.compute_txid());
+            txnum.increment_by(1);
+        }
+        Ok(Some(txids))
+    }
+
+    pub fn block_hash_at_height(&self, height: usize) -> Option<bitcoin::BlockHash> {
+        self.headers.block_hash_at_height(height)
+    }
+
+    pub fn block_header_at_height(&self, height: usize) -> Option<&bitcoin::block::Header> {
+        self.headers
+            .header_at_height(height)
+            .map(index::IndexedHeader::header)
+    }
+
     pub fn headers(&self) -> &headers::Headers {
         &self.headers
     }
@@ -401,6 +480,7 @@ mod tests {
         let config = Config {
             db_path: dir.path().to_path_buf(),
             url: format!("http://{}", node.params.rpc_socket),
+            secondary_path: None,
         };
         let mut chain = IndexedChain::from_config(config).unwrap();
         let stats = chain.sync(1000).unwrap();

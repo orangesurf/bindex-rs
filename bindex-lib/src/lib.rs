@@ -10,7 +10,7 @@ mod db;
 mod headers;
 mod index;
 
-pub use chain::IndexedChain;
+pub use chain::{Error as ChainError, IndexedChain, Stats};
 pub use headers::Headers;
 pub use index::ScriptHash;
 
@@ -29,6 +29,11 @@ impl Location<'_> {
 
     pub fn block_height(&self) -> usize {
         self.block_height
+    }
+
+    /// Transaction index within its containing block.
+    pub fn block_position(&self) -> u32 {
+        self.block_offset
     }
 }
 

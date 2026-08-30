@@ -9,6 +9,7 @@ use rust_rocksdb as rocksdb;
 pub struct DB {
     db: rocksdb::DB,
     compacting: bool,
+    secondary: bool,
 }
 
 fn default_opts() -> rocksdb::Options {
@@ -76,9 +77,49 @@ impl DB {
         let store = Self {
             db,
             compacting: false,
+            secondary: false,
         };
 
-        if let Some(config) = store.get_config()? {
+        store.validate_config()?;
+        store.log_metadata();
+        Ok(store)
+    }
+
+    pub fn open_as_secondary(
+        primary_path: impl AsRef<Path>,
+        secondary_path: impl AsRef<Path>,
+    ) -> Result<Self, rocksdb::Error> {
+        let opts = default_opts();
+        let primary_path = primary_path.as_ref();
+        let secondary_path = secondary_path.as_ref();
+        let db = rocksdb::DB::open_cf_descriptors_as_secondary(
+            &opts,
+            primary_path,
+            secondary_path,
+            cf_descriptors(&opts),
+        )?;
+
+        let store = Self {
+            db,
+            compacting: false,
+            secondary: true,
+        };
+
+        store.catch_up_with_primary()?;
+        store.validate_config()?;
+        store.log_metadata();
+        Ok(store)
+    }
+
+    pub fn catch_up_with_primary(&self) -> Result<(), rocksdb::Error> {
+        if self.secondary {
+            self.db.try_catch_up_with_primary()?;
+        }
+        Ok(())
+    }
+
+    fn validate_config(&self) -> Result<(), rocksdb::Error> {
+        if let Some(config) = self.get_config()? {
             const CURRENT: u64 = 1;
             if config.format < CURRENT {
                 panic!(
@@ -87,10 +128,13 @@ impl DB {
                 );
             }
         }
+        Ok(())
+    }
 
+    fn log_metadata(&self) {
         for &cf_name in COLUMN_FAMILIES {
-            let cf = store.cf(cf_name);
-            let metadata = store.db.get_column_family_metadata_cf(cf);
+            let cf = self.cf(cf_name);
+            let metadata = self.db.get_column_family_metadata_cf(cf);
             info!(
                 "CF {}: {} files, {:.6} MBs",
                 cf_name,
@@ -98,7 +142,6 @@ impl DB {
                 metadata.size as f64 / 1e6
             );
         }
-        Ok(store)
     }
 
     fn get_config(&self) -> Result<Option<Config>, rocksdb::Error> {

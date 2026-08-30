@@ -65,6 +65,15 @@ impl Headers {
         self.rows.iter()
     }
 
+    pub fn header_at_height(&self, height: usize) -> Option<&index::IndexedHeader> {
+        self.rows.get(height)
+    }
+
+    pub fn block_hash_at_height(&self, height: usize) -> Option<bitcoin::BlockHash> {
+        self.header_at_height(height)
+            .map(index::IndexedHeader::hash)
+    }
+
     pub fn get_header(
         &self,
         hash: BlockHash,
