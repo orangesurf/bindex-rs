@@ -99,6 +99,11 @@ pub struct Config {
     #[arg(long)]
     pub tor_broadcast_url: Option<String>,
 
+    /// Package push endpoint URL (blockchain.transaction.broadcast_package);
+    /// defaults to the /api/v1/txs/package endpoint beside --tor-broadcast-url
+    #[arg(long)]
+    pub tor_package_url: Option<String>,
+
     #[arg(long, default_value = "bindex electrum")]
     pub banner: String,
 
@@ -134,26 +139,56 @@ impl Config {
         }
         if self.broadcast_via == BroadcastVia::Tor {
             self.tor_broadcast_target()?;
+            self.tor_package_target()?;
         }
         Ok(())
+    }
+
+    /// mempool.space's onion serves each network under a path prefix.
+    fn onion_network_prefix(&self) -> anyhow::Result<&'static str> {
+        match self.network {
+            Network::Bitcoin => Ok(""),
+            Network::Testnet => Ok("/testnet"),
+            Network::Testnet4 => Ok("/testnet4"),
+            Network::Signet => Ok("/signet"),
+            network => anyhow::bail!(
+                "no default onion push endpoint for {network}; \
+                 pass --tor-broadcast-url or --broadcast-via bitcoind"
+            ),
+        }
     }
 
     pub fn tor_broadcast_target(&self) -> anyhow::Result<torpush::PushTarget> {
         let url = match &self.tor_broadcast_url {
             Some(url) => url.clone(),
-            None => {
-                let prefix = match self.network {
-                    Network::Bitcoin => "",
-                    Network::Testnet => "/testnet",
-                    Network::Testnet4 => "/testnet4",
-                    Network::Signet => "/signet",
-                    network => anyhow::bail!(
-                        "no default onion push endpoint for {network}; \
-                         pass --tor-broadcast-url or --broadcast-via bitcoind"
-                    ),
-                };
-                format!("http://{}{prefix}/api/tx", torpush::MEMPOOL_SPACE_ONION)
-            }
+            None => format!(
+                "http://{}{}/api/tx",
+                torpush::MEMPOOL_SPACE_ONION,
+                self.onion_network_prefix()?
+            ),
+        };
+        Ok(torpush::PushTarget::parse(&url)?)
+    }
+
+    /// Where `broadcast_package` pushes. With tor, packages must never fall
+    /// back to local bitcoind, so this is resolved (and validated) up front:
+    /// explicit `--tor-package-url`, else the package endpoint next to a
+    /// mempool-style `/api/tx` broadcast URL, else mempool.space's onion.
+    pub fn tor_package_target(&self) -> anyhow::Result<torpush::PushTarget> {
+        let url = match (&self.tor_package_url, &self.tor_broadcast_url) {
+            (Some(url), _) => url.clone(),
+            (None, None) => format!(
+                "http://{}{}/api/v1/txs/package",
+                torpush::MEMPOOL_SPACE_ONION,
+                self.onion_network_prefix()?
+            ),
+            (None, Some(tx_url)) => match tx_url.strip_suffix("/api/tx") {
+                Some(base) => format!("{base}/api/v1/txs/package"),
+                None => anyhow::bail!(
+                    "--tor-broadcast-url {tx_url:?} is not a mempool-style /api/tx endpoint, \
+                     so no package endpoint can be derived; pass --tor-package-url"
+                ),
+            },
         };
         Ok(torpush::PushTarget::parse(&url)?)
     }
@@ -176,5 +211,55 @@ impl Config {
         self.monitor_path
             .clone()
             .unwrap_or_else(|| self.bindex_db_path.join("electrum-monitor.json"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(args: &[&str]) -> Config {
+        let mut argv = vec!["bindex-electrum", "--bindex-db-path", "/nonexistent"];
+        argv.extend_from_slice(args);
+        Config::try_parse_from(argv).expect("args parse")
+    }
+
+    #[test]
+    fn package_endpoint_sits_beside_the_tx_endpoint() {
+        let c = config(&[]);
+        assert_eq!(
+            c.tor_broadcast_target().unwrap().url(),
+            format!("http://{}:80/api/tx", torpush::MEMPOOL_SPACE_ONION)
+        );
+        assert_eq!(
+            c.tor_package_target().unwrap().url(),
+            format!("http://{}:80/api/v1/txs/package", torpush::MEMPOOL_SPACE_ONION)
+        );
+
+        let c = config(&["--network", "signet"]);
+        assert_eq!(
+            c.tor_package_target().unwrap().url(),
+            format!("http://{}:80/signet/api/v1/txs/package", torpush::MEMPOOL_SPACE_ONION)
+        );
+
+        let c = config(&["--tor-broadcast-url", "http://push.example.onion:8080/api/tx"]);
+        assert_eq!(
+            c.tor_package_target().unwrap().url(),
+            "http://push.example.onion:8080/api/v1/txs/package"
+        );
+
+        let c = config(&["--tor-package-url", "http://pkg.example.onion/submit"]);
+        assert_eq!(c.tor_package_target().unwrap().url(), "http://pkg.example.onion:80/submit");
+    }
+
+    #[test]
+    fn custom_tx_endpoint_without_package_endpoint_is_rejected_up_front() {
+        let c = config(&["--tor-broadcast-url", "http://push.example.onion/push"]);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("--tor-package-url"), "{err}");
+        assert!(config(&["--tor-broadcast-url", "http://push.example.onion/push",
+                         "--tor-package-url", "http://push.example.onion/pkg"]).validate().is_ok());
+        assert!(config(&["--tor-broadcast-url", "http://push.example.onion/push",
+                         "--broadcast-via", "bitcoind"]).validate().is_ok());
     }
 }

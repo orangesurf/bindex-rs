@@ -564,11 +564,15 @@ passed through).
 
 #### `blockchain.transaction.broadcast_package(raw_txs, verbose = false)`
 
-Backend: `bitcoind_client`.
+Backend: selected by `--broadcast-via`, exactly like `broadcast` — with `tor`
+(the default) the package is POSTed as a JSON array through the tor SOCKS5
+proxy to the package endpoint (`--tor-package-url`, default mempool.space's
+onion `POST /api/v1/txs/package` beside the broadcast URL), which runs
+`submitpackage` remotely and returns its JSON; the same fresh-circuit-per-push
+rule applies, so no transaction ever leaves through the local bitcoind while
+in tor mode. With `bitcoind`, call `submitpackage` locally.
 
 Protocol `1.6` only.
-
-Call bitcoind `submitpackage` or equivalent.
 
 If `verbose == false`, normalize result:
 

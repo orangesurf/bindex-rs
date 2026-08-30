@@ -43,8 +43,15 @@ struct State {
     chain: ChainAdapter,
     mempool: RwLock<MempoolIndex>,
     bitcoind: RpcClient,
-    tor_push: Option<PushTarget>,
+    tor_push: Option<TorPush>,
     monitor: Monitor,
+}
+
+/// Both onion endpoints, resolved once at startup so a package push can never
+/// discover at request time that it has nowhere to go but local bitcoind.
+struct TorPush {
+    tx: PushTarget,
+    package: PushTarget,
 }
 
 impl Server {
@@ -60,15 +67,19 @@ impl Server {
         );
         let tor_push = match config.broadcast_via {
             BroadcastVia::Tor => {
-                let target = config
+                let tx = config
                     .tor_broadcast_target()
                     .context("resolve tor broadcast target")?;
+                let package = config
+                    .tor_package_target()
+                    .context("resolve tor package target")?;
                 log::info!(
-                    "broadcasting via tor proxy {} to {}",
+                    "broadcasting via tor proxy {} to {} (packages: {})",
                     config.tor_proxy,
-                    target.url()
+                    tx.url(),
+                    package.url()
                 );
-                Some(target)
+                Some(TorPush { tx, package })
             }
             BroadcastVia::Bitcoind => None,
         };
@@ -385,11 +396,7 @@ impl Server {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                self.state
-                    .bitcoind
-                    .broadcast_package(&raw)
-                    .await
-                    .map_err(|err| ProtocolError::Server(err.to_string()))
+                self.broadcast_package(&raw).await
             }
             "blockchain.transaction.get_merkle" => self.transaction_get_merkle(&request.params),
             "blockchain.transaction.id_from_pos" => self.transaction_id_from_pos(&request.params),
@@ -422,7 +429,7 @@ impl Server {
     }
 
     async fn broadcast(&self, raw_tx_hex: &str) -> Result<Value, ProtocolError> {
-        let Some(target) = &self.state.tor_push else {
+        let Some(TorPush { tx: target, .. }) = &self.state.tor_push else {
             return self
                 .state
                 .bitcoind
@@ -444,6 +451,26 @@ impl Server {
             log::warn!("push endpoint returned {response:?} for txid {txid}");
         }
         Ok(json!(txid.to_string()))
+    }
+
+    /// Same rule as single broadcasts: with `--broadcast-via tor`, packages go
+    /// to the onion package endpoint on their own circuit and never touch the
+    /// local bitcoind's `submitpackage`. The endpoint's JSON (bitcoind's
+    /// submitpackage result) is returned as-is, exactly like the RPC path.
+    async fn broadcast_package(&self, raw_txs: &[String]) -> Result<Value, ProtocolError> {
+        match &self.state.tor_push {
+            Some(TorPush { package, .. }) => {
+                torpush::push_package(self.state.config.tor_proxy, package, raw_txs)
+                    .await
+                    .map_err(|err| ProtocolError::Server(err.to_string()))
+            }
+            None => self
+                .state
+                .bitcoind
+                .broadcast_package(raw_txs)
+                .await
+                .map_err(|err| ProtocolError::Server(err.to_string())),
+        }
     }
 
     fn server_version(

@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpStream,
@@ -98,15 +99,44 @@ impl PushTarget {
 /// `.onion`). Returns the response body, which mempool.space's `POST /api/tx`
 /// sets to the txid.
 pub async fn push_tx(proxy: SocketAddr, target: &PushTarget, tx_hex: &str) -> Result<String, Error> {
-    tokio::time::timeout(PUSH_TIMEOUT, push_tx_inner(proxy, target, tx_hex))
+    let body = push(proxy, target, "text/plain", tx_hex.as_bytes()).await?;
+    Ok(body.trim().to_string())
+}
+
+/// POST a package (JSON array of raw tx hex) to the package endpoint through
+/// the same proxy — mempool.space's `POST /api/v1/txs/package` runs bitcoind
+/// `submitpackage` and returns its JSON result verbatim; rejections come back
+/// as HTTP 400 with `{"error": "submitpackage RPC error: …"}`, surfaced here
+/// as [`Error::Http`]. Same transport as [`push_tx`], so it gets the same
+/// per-push circuit isolation: no transaction ever leaves via local bitcoind.
+pub async fn push_package(
+    proxy: SocketAddr,
+    target: &PushTarget,
+    raw_txs: &[String],
+) -> Result<Value, Error> {
+    let payload = serde_json::to_vec(raw_txs).expect("a list of strings always encodes");
+    let body = push(proxy, target, "application/json", &payload).await?;
+    serde_json::from_str(&body)
+        .map_err(|err| Error::BadResponse(format!("package endpoint returned non-JSON body: {err}")))
+}
+
+/// One HTTP POST over a fresh SOCKS5 stream (and, with tor, a fresh circuit).
+async fn push(
+    proxy: SocketAddr,
+    target: &PushTarget,
+    content_type: &str,
+    payload: &[u8],
+) -> Result<String, Error> {
+    tokio::time::timeout(PUSH_TIMEOUT, push_inner(proxy, target, content_type, payload))
         .await
         .map_err(|_| Error::Timeout(PUSH_TIMEOUT))?
 }
 
-async fn push_tx_inner(
+async fn push_inner(
     proxy: SocketAddr,
     target: &PushTarget,
-    tx_hex: &str,
+    content_type: &str,
+    payload: &[u8],
 ) -> Result<String, Error> {
     let mut stream = TcpStream::connect(proxy).await?;
     socks5_connect(&mut stream, &target.host, target.port).await?;
@@ -115,17 +145,18 @@ async fn push_tx_inner(
         "POST {} HTTP/1.1\r\n\
          Host: {}\r\n\
          User-Agent: bindex-electrum/{}\r\n\
-         Content-Type: text/plain\r\n\
+         Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n",
         target.path,
         target.host,
         env!("CARGO_PKG_VERSION"),
-        tx_hex.len(),
+        content_type,
+        payload.len(),
     );
     stream.write_all(request.as_bytes()).await?;
-    stream.write_all(tx_hex.as_bytes()).await?;
+    stream.write_all(payload).await?;
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await?;
@@ -134,7 +165,7 @@ async fn push_tx_inner(
         let body = body.trim().chars().take(MAX_ERROR_BODY_CHARS).collect();
         return Err(Error::Http { status, body });
     }
-    Ok(body.trim().to_string())
+    Ok(body)
 }
 
 /// Fresh SOCKS5 credentials for one push. Tor never checks them; it uses them
@@ -467,6 +498,50 @@ mod tests {
             }
             other => panic!("expected HTTP error, got {other:?}"),
         }
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pushes_package_through_socks5_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let result = r#"{"package_msg":"success","tx-results":{},"replaced-transactions":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{result}",
+            result.len()
+        );
+        let mock = tokio::spawn(run_mock_proxy(listener, response));
+
+        let target = PushTarget::parse("http://push.example.onion/api/v1/txs/package").unwrap();
+        let raw = vec!["aa".to_string(), "bb".to_string()];
+        let value = push_package(proxy, &target, &raw).await.unwrap();
+        assert_eq!(value["package_msg"], "success");
+
+        let (host, _, request, _) = mock.await.unwrap();
+        assert_eq!(host, "push.example.onion");
+        assert!(request.starts_with("POST /api/v1/txs/package HTTP/1.1\r\n"));
+        assert!(request.contains("\r\nContent-Type: application/json\r\n"));
+        assert!(request.ends_with("\r\n\r\n[\"aa\",\"bb\"]"));
+    }
+
+    #[tokio::test]
+    async fn surfaces_package_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        // Exactly what mempool.space answers for an undecodable package.
+        let body = r#"{"error":"submitpackage RPC error: {\"code\":-4}"}"#;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mock = tokio::spawn(run_mock_proxy(listener, response));
+
+        let target = PushTarget::parse("http://push.example.onion/api/v1/txs/package").unwrap();
+        let err = push_package(proxy, &target, &["00".to_string()]).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Http { status: 400, body } if body.contains("submitpackage")),
+            "unexpected error: {err:?}"
+        );
         mock.await.unwrap();
     }
 
