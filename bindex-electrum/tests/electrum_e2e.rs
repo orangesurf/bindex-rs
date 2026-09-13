@@ -1,3 +1,4 @@
+#![cfg(not(feature = "liquid"))] // drives a regtest bitcoind; Liquid is covered by the unit tests and fixtures
 use std::future;
 
 use anyhow::Context as _;
@@ -112,6 +113,7 @@ async fn electrum_server_serves_synced_regtest_chain() -> anyhow::Result<()> {
     let monitor_path = cache_dir.path().join("electrum-monitor.json");
     let config = Config {
         network: Network::Regtest,
+        db_name: None,
         bindex_db_path: db_dir.path().to_path_buf(),
         bitcoind_rest_url: rest_url,
         bitcoind_rpc_url: format!("http://{}", node.params.rpc_socket),
@@ -137,6 +139,7 @@ async fn electrum_server_serves_synced_regtest_chain() -> anyhow::Result<()> {
         broadcast_via: BroadcastVia::Bitcoind,
         tor_proxy: "127.0.0.1:9050".parse()?,
         tor_broadcast_url: None,
+        tor_package_url: None,
         banner: "bindex electrum test".to_string(),
         peer: Vec::new(),
         donation_address: None,

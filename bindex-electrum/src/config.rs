@@ -21,6 +21,11 @@ pub struct Config {
     #[arg(long, default_value = "bitcoin")]
     pub network: Network,
 
+    /// Name of the index directory under --bindex-db-path (default: the network
+    /// name on Bitcoin, "liquid" when built with the liquid feature)
+    #[arg(long)]
+    pub db_name: Option<String>,
+
     #[arg(long)]
     pub bindex_db_path: PathBuf,
 
@@ -87,8 +92,10 @@ pub struct Config {
     #[arg(long, default_value_t = 1000)]
     pub max_subscriptions_per_session: usize,
 
-    /// How blockchain.transaction.broadcast submits transactions
-    #[arg(long, value_enum, default_value_t = BroadcastVia::Tor)]
+    /// How blockchain.transaction.broadcast submits transactions (tor on
+    /// Bitcoin; the node's sendrawtransaction on Liquid, where mempool.space's
+    /// onion push endpoint would be the wrong chain)
+    #[arg(long, value_enum, default_value_t = default_broadcast_via())]
     pub broadcast_via: BroadcastVia,
 
     /// SOCKS5 address of the local tor daemon
@@ -114,7 +121,25 @@ pub struct Config {
     pub donation_address: Option<String>,
 }
 
+fn default_broadcast_via() -> BroadcastVia {
+    if bindex::fmt::NAME == "bitcoin" {
+        BroadcastVia::Tor
+    } else {
+        BroadcastVia::Bitcoind
+    }
+}
+
 impl Config {
+    pub fn db_name(&self) -> String {
+        self.db_name.clone().unwrap_or_else(|| {
+            if bindex::fmt::NAME == "bitcoin" {
+                self.network.to_string()
+            } else {
+                bindex::fmt::NAME.to_string()
+            }
+        })
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.protocol_min > self.protocol_max {
             anyhow::bail!("protocol-min must be <= protocol-max");
@@ -254,10 +279,10 @@ mod tests {
 
     #[test]
     fn custom_tx_endpoint_without_package_endpoint_is_rejected_up_front() {
-        let c = config(&["--tor-broadcast-url", "http://push.example.onion/push"]);
+        let c = config(&["--broadcast-via", "tor", "--tor-broadcast-url", "http://push.example.onion/push"]);
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("--tor-package-url"), "{err}");
-        assert!(config(&["--tor-broadcast-url", "http://push.example.onion/push",
+        assert!(config(&["--broadcast-via", "tor", "--tor-broadcast-url", "http://push.example.onion/push",
                          "--tor-package-url", "http://push.example.onion/pkg"]).validate().is_ok());
         assert!(config(&["--tor-broadcast-url", "http://push.example.onion/push",
                          "--broadcast-via", "bitcoind"]).validate().is_ok());

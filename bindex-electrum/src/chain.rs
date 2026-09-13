@@ -4,10 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::{
-    consensus::{deserialize, serialize},
-    OutPoint, Transaction, Txid,
-};
+use bindex::fmt;
+use bitcoin::{OutPoint, Txid};
 use serde::Serialize;
 
 use crate::{config::Config, merkle, protocol::ElectrumScripthash};
@@ -24,7 +22,7 @@ pub enum Error {
     Height(usize),
 
     #[error("transaction decode failed: {0}")]
-    Decode(#[from] bitcoin::consensus::encode::Error),
+    Decode(#[from] fmt::Error),
 
     #[error("invalid scripthash")]
     InvalidScripthash,
@@ -46,6 +44,15 @@ pub struct BlockHeaders {
     pub branch: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocatedTx {
+    pub raw: Vec<u8>,
+    pub height: usize,
+    pub block_hash: String,
+    pub position: u32,
+    pub confirmations: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,13 +89,14 @@ impl ChainAdapter {
     pub fn open(config: &Config) -> Result<Self, Error> {
         let secondary_path = config
             .bindex_db_path
-            .join(format!("{}-electrum-secondary", config.network));
-        let chain = bindex::IndexedChain::open_secondary_with_rest_url(
+            .join(format!("{}-electrum-secondary", config.db_name()));
+        let chain = bindex::IndexedChain::open_secondary_named(
             &config.bindex_db_path,
-            config.network,
+            &config.db_name(),
             config.bitcoind_rest_url.clone(),
             secondary_path,
         )?;
+        log::info!("chain format: {}", fmt::NAME);
         Ok(Self {
             chain: Arc::new(RwLock::new(chain)),
             refresh_interval: config.secondary_refresh_interval(),
@@ -134,11 +142,11 @@ impl ChainAdapter {
             return Ok(None);
         };
         let header = chain
-            .block_header_at_height(height)
+            .block_header_raw_at_height(height)?
             .ok_or(Error::Height(height))?;
         Ok(Some(HeaderNotification {
             height,
-            hex: hex::encode(serialize(header)),
+            hex: hex::encode(header),
         }))
     }
 
@@ -150,9 +158,9 @@ impl ChainAdapter {
     pub fn block_header_hex(&self, height: usize) -> Result<String, Error> {
         let chain = self.chain.read().map_err(|_| Error::Lock)?;
         let header = chain
-            .block_header_at_height(height)
+            .block_header_raw_at_height(height)?
             .ok_or(Error::Height(height))?;
-        Ok(hex::encode(serialize(header)))
+        Ok(hex::encode(header))
     }
 
     pub fn block_headers(
@@ -173,13 +181,11 @@ impl ChainAdapter {
             });
         }
         let count = count.min(2016).min(tip_height - start_height + 1);
-        let mut bytes = Vec::with_capacity(count * bitcoin::block::Header::SIZE);
-        for height in start_height..start_height + count {
-            let header = chain
-                .block_header_at_height(height)
-                .ok_or(Error::Height(height))?;
-            bytes.extend(serialize(header));
+        let headers = chain.block_headers_raw(start_height, count)?;
+        if headers.len() != count {
+            return Err(Error::Height(start_height + headers.len()));
         }
+        let bytes = headers.concat();
 
         let (branch, root) = if cp_height > 0 {
             let hashes = (0..=cp_height.min(tip_height))
@@ -241,12 +247,12 @@ impl ChainAdapter {
 
         for location in locations {
             let raw = chain.get_tx_bytes(&location)?;
-            let tx: Transaction = deserialize(&raw)?;
-            let txid = tx.compute_txid();
+            let tx = fmt::parse_tx(&raw)?;
+            let txid = tx.txid;
             let mut touches = false;
 
-            for (vout, output) in tx.output.iter().enumerate() {
-                if ElectrumScripthash::from_script(output.script_pubkey.as_script()) == scripthash {
+            for (vout, output) in tx.outputs.iter().enumerate() {
+                if ElectrumScripthash::from_script(bitcoin::Script::from_bytes(&output.script_pubkey)) == scripthash {
                     touches = true;
                     outputs.insert(
                         OutPoint {
@@ -257,20 +263,17 @@ impl ChainAdapter {
                             tx_hash: txid.to_string(),
                             tx_pos: vout as u32,
                             height: location.block_height() as i64,
-                            value: output.value.to_sat(),
-                            script_pubkey: output.script_pubkey.as_bytes().to_vec(),
+                            value: output.value,
+                            script_pubkey: output.script_pubkey.clone(),
                         },
                     );
                 }
             }
 
-            for input in &tx.input {
-                if input.previous_output.is_null() {
-                    continue;
-                }
-                if self.prevout_matches_scripthash(&chain, input.previous_output, scripthash)? {
+            for prevout in &tx.inputs {
+                if self.prevout_matches_scripthash(&chain, *prevout, scripthash)? {
                     touches = true;
-                    spent.insert(input.previous_output);
+                    spent.insert(*prevout);
                 }
             }
 
@@ -298,12 +301,26 @@ impl ChainAdapter {
     }
 
     pub fn transaction_by_txid(&self, txid: &bitcoin::Txid) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.located_transaction_by_txid(txid)?.map(|t| t.raw))
+    }
+
+    /// Raw bytes plus where the transaction sits in the chain.
+    pub fn located_transaction_by_txid(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<Option<LocatedTx>, Error> {
         let chain = self.chain.read().map_err(|_| Error::Lock)?;
+        let tip = chain.headers().tip_height().unwrap_or(0);
         for location in chain.locations_by_txid(txid)? {
             let raw = chain.get_tx_bytes(&location)?;
-            let tx: Transaction = deserialize(&raw)?;
-            if tx.compute_txid() == *txid {
-                return Ok(Some(raw));
+            if fmt::txid(&raw)? == *txid {
+                return Ok(Some(LocatedTx {
+                    raw,
+                    height: location.block_height(),
+                    block_hash: location.block_hash().to_string(),
+                    position: location.block_position(),
+                    confirmations: tip.saturating_sub(location.block_height()) + 1,
+                }));
             }
         }
         Ok(None)
@@ -324,15 +341,15 @@ impl ChainAdapter {
     ) -> Result<bool, Error> {
         for location in chain.locations_by_txid(&outpoint.txid)? {
             let raw = chain.get_tx_bytes(&location)?;
-            let tx: Transaction = deserialize(&raw)?;
-            if tx.compute_txid() != outpoint.txid {
+            let tx = fmt::parse_tx(&raw)?;
+            if tx.txid != outpoint.txid {
                 continue;
             }
-            let Some(output) = tx.output.get(outpoint.vout as usize) else {
+            let Some(output) = tx.outputs.get(outpoint.vout as usize) else {
                 return Ok(false);
             };
             return Ok(
-                ElectrumScripthash::from_script(output.script_pubkey.as_script()) == scripthash,
+                ElectrumScripthash::from_script(bitcoin::Script::from_bytes(&output.script_pubkey)) == scripthash,
             );
         }
         Ok(false)

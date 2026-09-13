@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use bitcoin::{consensus::deserialize, Transaction, Txid};
+use bitcoin::Txid;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
@@ -440,10 +440,9 @@ impl Server {
         };
         let raw = hex::decode(raw_tx_hex)
             .map_err(|_| ProtocolError::InvalidParams("raw_tx must be hex".to_string()))?;
-        let tx: Transaction = deserialize(&raw).map_err(|_| {
+        let txid = bindex::fmt::txid(&raw).map_err(|_| {
             ProtocolError::InvalidParams("raw_tx is not a valid transaction".to_string())
         })?;
-        let txid = tx.compute_txid();
         let response = torpush::push_tx(self.state.config.tor_proxy, target, raw_tx_hex)
             .await
             .map_err(|err| ProtocolError::Server(err.to_string()))?;
@@ -646,13 +645,24 @@ impl Server {
         if let Some(raw) = self.state.mempool.read().unwrap().raw_transaction(&txid) {
             return Ok(tx_value(raw, verbose));
         }
-        let raw = self
+        let located = self
             .state
             .chain
-            .transaction_by_txid(&txid)
+            .located_transaction_by_txid(&txid)
             .map_err(|err| ProtocolError::Server(err.to_string()))?
             .ok_or_else(|| ProtocolError::Server("transaction not found".to_string()))?;
-        Ok(tx_value(&raw, verbose))
+        if verbose {
+            // bitcoind-style verbose fields that a caller without txindex needs
+            return Ok(json!({
+                "hex": hex::encode(&located.raw),
+                "txid": txid.to_string(),
+                "height": located.height,
+                "blockhash": located.block_hash,
+                "confirmations": located.confirmations,
+                "position": located.position,
+            }));
+        }
+        Ok(tx_value(&located.raw, verbose))
     }
 
     fn transaction_get_merkle(&self, params: &Params) -> Result<Value, ProtocolError> {
