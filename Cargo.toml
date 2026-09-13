@@ -4,5 +4,6 @@ members = [
     "bindex-cli",
     "bindex-electrum",
     "bindex-lib",
+    "bindex-sync",
     "bindex-web",
 ]

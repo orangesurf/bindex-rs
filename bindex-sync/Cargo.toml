@@ -1,0 +1,16 @@
+[package]
+name = "bindex-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Keep a bindex index in sync with a node's REST API (the primary writer)"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+bindex = { path = "../bindex-lib" }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+
+[features]
+liquid = ["bindex/liquid"]
