@@ -8,7 +8,7 @@ use bitcoin::{hashes::Hash, Network};
 use bitcoin::{BlockHash, Txid};
 use log::*;
 
-use crate::{client, db, headers, index, Location};
+use crate::{client, db, fmt, headers, index, Location};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -35,6 +35,9 @@ pub enum Error {
 
     #[error("block not found: {0}")]
     BlockNotFound(#[from] headers::Reorg),
+
+    #[error("format error: {0}")]
+    Fmt(#[from] fmt::Error),
 }
 
 #[derive(Debug)]
@@ -71,13 +74,13 @@ pub struct Config {
 }
 
 struct HeaderChunk {
-    headers: Vec<bitcoin::block::Header>,
+    hashes: Vec<BlockHash>,
     to_skip: usize,
 }
 
 impl HeaderChunk {
-    fn get(&self) -> &[bitcoin::block::Header] {
-        &self.headers[self.to_skip..]
+    fn get(&self) -> &[BlockHash] {
+        &self.hashes[self.to_skip..]
     }
 }
 
@@ -89,13 +92,14 @@ struct PerBlockData {
 }
 
 struct Builder<'a> {
-    items: Vec<(index::TxNumRange, &'a PerBlockData)>,
+    items: Vec<(u32, index::TxNumRange, &'a PerBlockData)>,
     tip: BlockHash,
 }
 
 impl<'a> Builder<'a> {
     fn new(tip: Option<&index::IndexedHeader>, items: &'a [PerBlockData]) -> Self {
         let mut next_txnum = tip.map_or_else(index::TxNum::default, |header| header.next_txnum());
+        let mut height = tip.map_or(0, |header| header.height() + 1);
         let tip = tip.map_or_else(bitcoin::BlockHash::all_zeros, |header| header.hash());
 
         let items = items
@@ -104,7 +108,9 @@ impl<'a> Builder<'a> {
                 let first_txnum = next_txnum;
                 next_txnum.increment_by(data.txs_count);
                 let range = index::TxNumRange::new(first_txnum, next_txnum);
-                (range, data)
+                let h = height;
+                height += 1;
+                (h, range, data)
             })
             .collect();
         Self { items, tip }
@@ -114,12 +120,13 @@ impl<'a> Builder<'a> {
         use rayon::prelude::*;
 
         for pair in self.items.windows(2) {
-            assert!(index::TxNumRange::adjacent(&pair[0].0, &pair[1].0));
+            assert!(index::TxNumRange::adjacent(&pair[0].1, &pair[1].1));
+            assert_eq!(pair[0].0 + 1, pair[1].0);
         }
         let batches = self
             .items
             .into_par_iter()
-            .map(|(txnum_range, data)| {
+            .map(|(height, txnum_range, data)| {
                 let PerBlockData {
                     blockhash,
                     block_bytes,
@@ -127,13 +134,13 @@ impl<'a> Builder<'a> {
                     txs_count,
                 } = data;
                 assert_eq!(txnum_range.len(), *txs_count);
-                index::Batch::build(txnum_range, *blockhash, block_bytes, spent_bytes)
+                index::Batch::build(height, txnum_range, *blockhash, block_bytes, spent_bytes)
             })
             .collect::<Result<Vec<_>, index::Error>>()?;
         let mut tip = self.tip;
         for batch in &batches {
             let header = &batch.header;
-            assert_eq!(tip, header.header().prev_blockhash);
+            assert_eq!(tip, header.prev_blockhash());
             tip = header.hash();
         }
         Ok(batches)
@@ -144,7 +151,7 @@ impl IndexedChain {
     /// Open an existing DB, or create if missing.
     /// Use binary format REST API for fetching the data from bitcoind.
     pub fn open(db_dir: impl AsRef<Path>, network: Network) -> Result<Self, Error> {
-        let db_path = db_dir.as_ref().to_path_buf().join(network.to_string());
+        let db_path = db_dir.as_ref().to_path_buf().join(db_name(network));
         let url = format!("http://localhost:{}", default_rpc_port(network));
         Self::from_config(Config {
             db_path,
@@ -158,7 +165,7 @@ impl IndexedChain {
         network: Network,
         rest_url: impl Into<String>,
     ) -> Result<Self, Error> {
-        let db_path = db_dir.as_ref().to_path_buf().join(network.to_string());
+        let db_path = db_dir.as_ref().to_path_buf().join(db_name(network));
         Self::from_config(Config {
             db_path,
             url: rest_url.into(),
@@ -172,9 +179,36 @@ impl IndexedChain {
         rest_url: impl Into<String>,
         secondary_path: impl AsRef<Path>,
     ) -> Result<Self, Error> {
-        let db_path = db_dir.as_ref().to_path_buf().join(network.to_string());
+        let db_path = db_dir.as_ref().to_path_buf().join(db_name(network));
         Self::from_config(Config {
             db_path,
+            url: rest_url.into(),
+            secondary_path: Some(secondary_path.as_ref().to_path_buf()),
+        })
+    }
+
+    /// Open (or create) the index under `db_dir/<name>` as the primary writer.
+    pub fn open_named(
+        db_dir: impl AsRef<Path>,
+        name: &str,
+        rest_url: impl Into<String>,
+    ) -> Result<Self, Error> {
+        Self::from_config(Config {
+            db_path: db_dir.as_ref().to_path_buf().join(name),
+            url: rest_url.into(),
+            secondary_path: None,
+        })
+    }
+
+    /// Open the index under `db_dir/<name>` as a read-only secondary.
+    pub fn open_secondary_named(
+        db_dir: impl AsRef<Path>,
+        name: &str,
+        rest_url: impl Into<String>,
+        secondary_path: impl AsRef<Path>,
+    ) -> Result<Self, Error> {
+        Self::from_config(Config {
+            db_path: db_dir.as_ref().to_path_buf().join(name),
             url: rest_url.into(),
             secondary_path: Some(secondary_path.as_ref().to_path_buf()),
         })
@@ -256,7 +290,7 @@ impl IndexedChain {
         // let stale_hash = stale.hash();
         // let mut builder: index::IndexBuilder = index::IndexBuilder::new(self.headers.tip());
         // builder.add(stale_hash, &self.fetch_data(stale_hash)?)?;
-        self.store.delete(&self.index(&[*stale.header()], None)?)?;
+        self.store.delete(&self.index(&[stale.hash()], None)?)?;
         Ok(stale.hash())
     }
 
@@ -270,7 +304,8 @@ impl IndexedChain {
             }
             let headers = self.client.get_headers(blockhash, limit)?;
             if !headers.is_empty() {
-                return Ok(HeaderChunk { headers, to_skip });
+                let hashes = headers.into_iter().map(|h| h.hash).collect();
+                return Ok(HeaderChunk { hashes, to_skip });
             }
             warn!(
                 "block={} height={} was rolled back",
@@ -298,16 +333,16 @@ impl IndexedChain {
 
     fn index(
         &self,
-        headers: &[bitcoin::block::Header],
+        hashes: &[BlockHash],
         mut stats: Option<&mut Stats>,
     ) -> Result<Vec<index::Batch>, Error> {
         use rayon::prelude::*;
 
-        let mut batches = Vec::with_capacity(headers.len());
-        for chunk in headers.chunks(10) {
+        let mut batches = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(10) {
             let items: Vec<_> = chunk
                 .par_iter()
-                .map(|header| self.fetch_data(header.block_hash()))
+                .map(|hash| self.fetch_data(*hash))
                 .collect::<Result<Vec<_>, Error>>()?;
 
             let tip = batches
@@ -419,8 +454,7 @@ impl IndexedChain {
         for _ in 0..txs_count {
             let location = self.headers.find_by_txnum(txnum);
             let raw = self.get_tx_bytes(&location)?;
-            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)?;
-            txids.push(tx.compute_txid());
+            txids.push(fmt::txid(&raw)?);
             txnum.increment_by(1);
         }
         Ok(Some(txids))
@@ -430,14 +464,87 @@ impl IndexedChain {
         self.headers.block_hash_at_height(height)
     }
 
-    pub fn block_header_at_height(&self, height: usize) -> Option<&bitcoin::block::Header> {
-        self.headers
-            .header_at_height(height)
-            .map(index::IndexedHeader::header)
+    /// Decoded Bitcoin header (Bitcoin format only).
+    #[cfg(not(feature = "liquid"))]
+    pub fn block_header_at_height(
+        &self,
+        height: usize,
+    ) -> Result<Option<bitcoin::block::Header>, Error> {
+        Ok(self
+            .block_header_raw_at_height(height)?
+            .map(|raw| bitcoin::consensus::deserialize(&raw))
+            .transpose()?)
+    }
+
+    /// Raw header bytes as the node serializes them: read from the row on
+    /// Bitcoin, fetched from the REST API on Liquid (not stored).
+    pub fn block_header_raw_at_height(&self, height: usize) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.block_headers_raw(height, 1)?.into_iter().next())
+    }
+
+    /// Raw headers for `count` consecutive heights starting at `start`
+    /// (fewer if the chain ends first).
+    pub fn block_headers_raw(&self, start: usize, count: usize) -> Result<Vec<Vec<u8>>, Error> {
+        let Some(first) = self.headers.header_at_height(start) else {
+            return Ok(vec![]);
+        };
+        let available = self.headers.tip_height().map_or(0, |tip| tip + 1 - start);
+        let count = count.min(available);
+        if count == 0 {
+            return Ok(vec![]);
+        }
+        if cfg!(feature = "liquid") {
+            // one REST round trip; verify each returned header is the one we indexed
+            let fetched = self.client.get_headers(first.hash(), count - 1)?;
+            let mut out = Vec::with_capacity(count);
+            for (i, raw) in fetched.into_iter().take(count).enumerate() {
+                let expected = self.headers.header_at_height(start + i).expect("height in range");
+                if raw.hash != expected.hash() {
+                    return Err(Error::BlockNotFound(headers::Reorg::Stale(raw.hash, start + i)));
+                }
+                out.push(raw.raw);
+            }
+            Ok(out)
+        } else {
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                let header = self.headers.header_at_height(start + i).expect("height in range");
+                let value = self
+                    .store
+                    .get_header_value(&header.key())?
+                    .ok_or(headers::Reorg::Missing(header.hash(), start + i))?;
+                out.push(raw_from_bitcoin_value(&value));
+            }
+            Ok(out)
+        }
+    }
+
+    pub fn indexed_header_at_height(&self, height: usize) -> Option<&index::IndexedHeader> {
+        self.headers.header_at_height(height)
     }
 
     pub fn headers(&self) -> &headers::Headers {
         &self.headers
+    }
+}
+
+#[cfg(not(feature = "liquid"))]
+fn raw_from_bitcoin_value(value: &[u8]) -> Vec<u8> {
+    index::IndexedHeader::raw_from_value(value).to_vec()
+}
+
+#[cfg(feature = "liquid")]
+fn raw_from_bitcoin_value(_value: &[u8]) -> Vec<u8> {
+    unreachable!("Liquid header rows carry no raw header")
+}
+
+/// Directory name of the index under `db_dir`: the network name on Bitcoin
+/// (`bitcoin`, `signet`, ...), the format name on Liquid.
+fn db_name(network: Network) -> String {
+    if fmt::NAME == "bitcoin" {
+        network.to_string()
+    } else {
+        fmt::NAME.to_string()
     }
 }
 
@@ -451,7 +558,7 @@ fn default_rpc_port(nework: Network) -> u16 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "liquid")))]
 mod tests {
     use super::*;
     use bitcoin::{consensus::deserialize, Amount, Transaction};

@@ -22,8 +22,9 @@ impl Headers {
     /// Build a chain from a list of headers (sorted by height).
     pub fn new(rows: Vec<index::IndexedHeader>) -> Self {
         let mut block_hash = bitcoin::BlockHash::all_zeros();
-        for row in &rows {
-            assert_eq!(row.header().prev_blockhash, block_hash);
+        for (height, row) in rows.iter().enumerate() {
+            assert_eq!(row.prev_blockhash(), block_hash);
+            assert_eq!(row.height() as usize, height);
             block_hash = row.hash();
         }
         Self { rows }
@@ -44,7 +45,8 @@ impl Headers {
 
     /// Add new tip.
     pub fn add(&mut self, tip: index::IndexedHeader) {
-        assert_eq!(tip.header().prev_blockhash, self.tip_hash());
+        assert_eq!(tip.prev_blockhash(), self.tip_hash());
+        assert_eq!(tip.height() as usize, self.rows.len());
         self.rows.push(tip)
     }
 
@@ -89,14 +91,12 @@ impl Headers {
 
     /// Find transaction's chain location.
     pub fn find_by_txnum(&self, txnum: index::TxNum) -> Location<'_> {
-        // Compare each header using its `next_txnum`
-        let block_height = match self
+        // The first block whose `next_txnum` is past `txnum` contains it. Empty
+        // blocks (possible on Liquid) share a `next_txnum`, so a plain binary
+        // search could land on any of them; `partition_point` cannot.
+        let block_height = self
             .rows
-            .binary_search_by_key(&txnum, index::IndexedHeader::next_txnum)
-        {
-            Ok(i) => i + 1, // hitting exactly a block boundary `txnum` -> next block
-            Err(i) => i,
-        };
+            .partition_point(|header| header.next_txnum() <= txnum);
 
         let indexed_header = self.rows.get(block_height).expect("missing height");
         assert!(

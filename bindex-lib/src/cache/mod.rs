@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fmt::Debug};
 
 use bitcoin::{
-    consensus::{deserialize, serialize},
+    consensus::deserialize,
     hashes::Hash,
     Txid,
 };
@@ -96,7 +96,7 @@ impl Cache {
                 );
             }
             // Some headers/transactions can be false-positives (since we don't store the full scripthash)
-            self.add_headers(new_headers.into_iter())?;
+            self.add_headers(new_headers.into_iter(), chain)?;
             self.add_transactions(new_locations.into_iter(), chain)?;
             // Keep only history entries related to the watched scripthashes
             self.add_history(new_history.into_iter())?;
@@ -187,17 +187,17 @@ impl Cache {
     fn add_headers<'a>(
         &self,
         entries: impl Iterator<Item = (usize, &'a index::IndexedHeader)>,
+        chain: &IndexedChain,
     ) -> Result<usize, Error> {
         let mut insert = self
             .db
             .prepare("INSERT OR IGNORE INTO headers VALUES (?1, ?2, ?3)")?;
         let mut rows = 0;
         for (height, header) in entries {
-            rows += insert.execute((
-                height,
-                header.hash().as_byte_array(),
-                serialize(header.header()),
-            ))?;
+            let raw = chain
+                .block_header_raw_at_height(height)?
+                .expect("indexed header has no raw bytes");
+            rows += insert.execute((height, header.hash().as_byte_array(), raw))?;
         }
         Ok(rows)
     }

@@ -200,7 +200,7 @@ impl DB {
         // key = next_txnum, value = blockhash || blockheader
         let cf = self.cf(HEADERS_CF);
         for batch in batches {
-            let (key, value) = batch.header.serialize();
+            let (key, value) = batch.header.serialize(&batch.raw_header);
             f(&mut write_batch, cf, &key, &value);
         }
 
@@ -301,16 +301,18 @@ impl DB {
         panic!("Missing {:?}", txnum)
     }
 
+    /// Raw value of a header row (`None` if missing).
+    pub fn get_header_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>, rocksdb::Error> {
+        self.db.get_cf(self.cf(HEADERS_CF), key)
+    }
+
     /// Load all headers from DB.
     pub fn headers(&self) -> Result<Vec<index::IndexedHeader>, rocksdb::Error> {
         let cf = self.cf(HEADERS_CF);
         let mut result = Vec::with_capacity(1_000_000);
-        for kv in self.db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+        for (position, kv) in self.db.iterator_cf(cf, rocksdb::IteratorMode::Start).enumerate() {
             let (key, value) = kv?;
-            let row = index::IndexedHeader::deserialize((
-                key[..].try_into().unwrap(),
-                value[..].try_into().unwrap(),
-            ));
+            let row = index::IndexedHeader::deserialize(&key[..], &value[..], position);
             result.push(row)
         }
         Ok(result)

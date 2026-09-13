@@ -1,3 +1,4 @@
+#![cfg(not(feature = "liquid"))]
 use std::ops::ControlFlow;
 
 use bitcoin_slices::{bsl, Visit as _};

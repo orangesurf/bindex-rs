@@ -1,9 +1,14 @@
+#[cfg(not(feature = "liquid"))]
 use std::ops::ControlFlow;
 
 use bitcoin::hashes::Hash;
-use bitcoin_slices::{bsl, Parse, Visit};
+use bitcoin_slices::{bsl, Parse};
+#[cfg(not(feature = "liquid"))]
+use bitcoin_slices::Visit;
 
-use crate::index::{BlockBytes, Error, HashPrefixRow, IndexedBlock, SpentBytes, TxNum};
+use crate::index::{Error, HashPrefixRow, SpentBytes, TxNum};
+#[cfg(not(feature = "liquid"))]
+use crate::index::{BlockBytes, IndexedBlock};
 
 bitcoin::hashes::hash_newtype! {
     /// https://electrumx-spesmilo.readthedocs.io/en/latest/protocol-basics.html#script-hashes
@@ -28,12 +33,7 @@ impl<'a> IndexVisitor<'a> {
     }
 
     fn add(&mut self, script: &bitcoin::Script) {
-        if script.is_op_return() {
-            // skip indexing unspendable outputs
-            return;
-        }
-        let prefix = ScriptHash::new(script).into();
-        self.rows.push(HashPrefixRow::new(prefix, self.txnum));
+        add_script(self.rows, self.txnum, script)
     }
 
     fn finish_tx(&mut self) {
@@ -41,6 +41,7 @@ impl<'a> IndexVisitor<'a> {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 impl bitcoin_slices::Visitor for IndexVisitor<'_> {
     fn visit_tx_out(&mut self, _vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
         self.add(bitcoin::Script::from_bytes(tx_out.script_pubkey()));
@@ -52,6 +53,21 @@ impl bitcoin_slices::Visitor for IndexVisitor<'_> {
         self.finish_tx();
         ControlFlow::Continue(())
     }
+}
+
+/// Index one output script for `txnum`. Unspendable OP_RETURN outputs are
+/// skipped; on Liquid so are empty scripts (fee outputs and peg-in placeholders
+/// in the spent stream), which no client can ever query.
+pub(crate) fn add_script(rows: &mut Vec<HashPrefixRow>, txnum: TxNum, script: &bitcoin::Script) {
+    if script.is_op_return() {
+        return;
+    }
+    #[cfg(feature = "liquid")]
+    if script.is_empty() {
+        return;
+    }
+    let prefix = ScriptHash::new(script).into();
+    rows.push(HashPrefixRow::new(prefix, txnum));
 }
 
 struct Spent;
@@ -84,6 +100,7 @@ fn visit_spent<'a>(
     Ok(bitcoin_slices::ParseResult::new(&slice[consumed..], Spent))
 }
 
+#[cfg(not(feature = "liquid"))]
 fn add_block_rows(
     block: &BlockBytes,
     txnum: TxNum,
@@ -97,7 +114,7 @@ fn add_block_rows(
     Ok(visitor.txnum)
 }
 
-fn add_spent_rows(
+pub(crate) fn add_spent_rows(
     spent: &SpentBytes,
     txnum: TxNum,
     rows: &mut Vec<HashPrefixRow>,
@@ -110,6 +127,7 @@ fn add_spent_rows(
     Ok(visitor.txnum)
 }
 
+#[cfg(not(feature = "liquid"))]
 pub fn index(
     block: &BlockBytes,
     spent: &SpentBytes,
@@ -123,7 +141,7 @@ pub fn index(
     Ok(result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "liquid")))]
 mod tests {
     use bitcoin::consensus::{deserialize, encode::Decodable};
     use hex_lit::hex;
@@ -137,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_index_block() -> Result<(), Error> {
-        let block_bytes = BlockBytes(hex!(BLOCK_HEX).to_vec());
+        let block_bytes = BlockBytes::new(hex!(BLOCK_HEX).to_vec());
         let spent_bytes = SpentBytes(hex!(SPENT_HEX).to_vec());
         let txnum = TxNum(10);
 
@@ -185,6 +203,7 @@ mod tests {
         // Verify public interface
         let block: bitcoin::Block = deserialize(&block_bytes.0).unwrap();
         let batch = Batch::build(
+            100_000,
             TxNumRange::new(txnum, TxNum(14)),
             block.block_hash(),
             &block_bytes,

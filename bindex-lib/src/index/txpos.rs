@@ -1,7 +1,11 @@
+#[cfg(not(feature = "liquid"))]
 use std::ops::ControlFlow;
 
-use super::{BlockBytes, Error, IndexedBlock, TxNum};
+use super::TxNum;
+#[cfg(not(feature = "liquid"))]
+use super::{BlockBytes, Error, IndexedBlock};
 use bitcoin::consensus::{Decodable, Encodable};
+#[cfg(not(feature = "liquid"))]
 use bitcoin_slices::{bsl, Visit as _};
 
 /// Transaction position within a block.
@@ -115,7 +119,7 @@ impl TxBlockPosRow {
     const CHUNK_SIZE: usize = 64;
 
     /// Chunkify `positions` into a list of `TxBlockPosRow` entries.
-    fn chunkify(positions: &[(TxNum, TxBlockPos)]) -> Vec<TxBlockPosRow> {
+    pub(crate) fn chunkify(positions: &[(TxNum, TxBlockPos)]) -> Vec<TxBlockPosRow> {
         for pair in positions.windows(2) {
             let (prev_num, prev_pos) = pair[0];
             let (next_num, next_pos) = pair[1];
@@ -159,12 +163,14 @@ impl TxBlockPosRow {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 struct TxPosVisitor<'a> {
     positions: &'a mut Vec<(TxNum, TxBlockPos)>,
     tx_num: TxNum,
     tx_offset: u32,
 }
 
+#[cfg(not(feature = "liquid"))]
 impl<'a> TxPosVisitor<'a> {
     fn new(positions: &'a mut Vec<(TxNum, TxBlockPos)>, tx_num: TxNum) -> Self {
         Self {
@@ -175,6 +181,7 @@ impl<'a> TxPosVisitor<'a> {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 impl bitcoin_slices::Visitor for TxPosVisitor<'_> {
     fn visit_block_begin(&mut self, n: usize) {
         self.tx_offset += bitcoin::VarInt(n as u64).size() as u32;
@@ -194,6 +201,7 @@ impl bitcoin_slices::Visitor for TxPosVisitor<'_> {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 pub fn index(block: &BlockBytes, txnum: TxNum) -> Result<IndexedBlock<TxBlockPosRow>, Error> {
     let mut positions = vec![];
     let mut visitor = TxPosVisitor::new(&mut positions, txnum);

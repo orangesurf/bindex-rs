@@ -1,10 +1,6 @@
 use std::{io::ErrorKind, time::Duration};
 
-use bitcoin::{
-    block::Header,
-    consensus::{deserialize, Decodable},
-    BlockHash,
-};
+use bitcoin::{consensus::deserialize, BlockHash};
 use log::*;
 
 use crate::index;
@@ -19,6 +15,9 @@ pub enum Error {
 
     #[error("decoding failed: {0}")]
     Decoding(#[from] bitcoin::consensus::encode::Error),
+
+    #[error("format error: {0}")]
+    Fmt(#[from] crate::fmt::Error),
 }
 
 pub struct Client {
@@ -43,7 +42,15 @@ impl Client {
             let res = req.call();
             debug!("<= {:?}", res);
             let err = match res {
-                Ok(resp) => return Ok(resp.into_body().read_to_vec()?),
+                // ureq caps bodies at 10 MB by default; a page of 2000 Liquid
+                // dynafed headers or a large block can exceed that.
+                Ok(mut resp) => {
+                    return Ok(resp
+                        .body_mut()
+                        .with_config()
+                        .limit(1 << 30)
+                        .read_to_vec()?)
+                }
                 Err(err) => err,
             };
             if iter > 100 {
@@ -70,20 +77,15 @@ impl Client {
         Ok(deserialize(&data)?)
     }
 
-    pub fn get_headers(&self, hash: BlockHash, limit: usize) -> Result<Vec<Header>, Error> {
+    pub fn get_headers(
+        &self,
+        hash: BlockHash,
+        limit: usize,
+    ) -> Result<Vec<crate::fmt::RawHeader>, Error> {
         let url = format!("{}/rest/headers/{}/{}.bin", self.url, limit + 1, hash);
         let data = self.get_bytes(&url)?;
-        assert_eq!(data.len() % Header::SIZE, 0);
-        let count = data.len() / Header::SIZE;
-
         // the first header should correspond to `hash`
-        let mut headers = Vec::with_capacity(count);
-        let mut r = bitcoin::io::Cursor::new(data);
-        for _ in 0..count {
-            let header = Header::consensus_decode_from_finite_reader(&mut r)?;
-            headers.push(header);
-        }
-        Ok(headers)
+        Ok(crate::fmt::split_headers(&data)?)
     }
 
     pub fn get_block_bytes(&self, hash: BlockHash) -> Result<index::BlockBytes, Error> {
@@ -113,7 +115,7 @@ impl Client {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "liquid")))]
 mod tests {
     use super::*;
     use bitcoin::{consensus::serialize, hashes::Hash};
@@ -183,7 +185,9 @@ mod tests {
                 .block_header()
                 .unwrap();
 
-            assert_eq!(headers, vec![expected]);
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers[0].hash, expected.block_hash());
+            assert_eq!(headers[0].raw, serialize(&expected));
             assert_eq!(serialize(&expected), header_bytes);
         }
 

@@ -1,16 +1,18 @@
 pub use bitcoin;
 pub use bitcoin_slices;
 
-#[cfg(feature = "cache")]
+#[cfg(all(feature = "cache", not(feature = "liquid")))]
 pub mod cache;
 
 mod chain;
 mod client;
 mod db;
+pub mod fmt;
 mod headers;
 mod index;
 
-pub use chain::{Error as ChainError, IndexedChain, Stats};
+pub use chain::{Config as ChainConfig, Error as ChainError, IndexedChain, Stats};
+pub use index::IndexedHeader;
 pub use headers::Headers;
 pub use index::ScriptHash;
 

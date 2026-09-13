@@ -20,6 +20,9 @@ pub enum Error {
 
     #[error("{0} bytes were not parsed")]
     Leftover(usize),
+
+    #[error("format error: {0}")]
+    Fmt(#[from] crate::fmt::Error),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
@@ -132,15 +135,26 @@ impl HashPrefixRow {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct BlockBytes(Vec<u8>);
+pub struct BlockBytes(Vec<u8>, usize /* header length */);
 
 impl BlockBytes {
     pub fn new(data: Vec<u8>) -> Self {
-        BlockBytes(data)
+        let header_len = crate::fmt::header_len(&data).expect("cannot parse block header");
+        BlockBytes(data, header_len)
     }
 
     pub fn header(&self) -> &[u8] {
-        &self.0[..bitcoin::block::Header::SIZE]
+        &self.0[..self.1]
+    }
+
+    #[allow(dead_code)]
+    pub fn header_len(&self) -> usize {
+        self.1
+    }
+
+    #[allow(dead_code)]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 
     pub fn len(&self) -> usize {
@@ -148,7 +162,7 @@ impl BlockBytes {
     }
 
     pub fn txs_count(&self) -> u32 {
-        parse_txs_count(&self.0[bitcoin::block::Header::SIZE..])
+        parse_txs_count(&self.0[self.1..])
     }
 }
 
@@ -176,11 +190,13 @@ fn parse_txs_count(slice: &[u8]) -> u32 {
         .expect("txs count too large")
 }
 
+#[cfg(not(feature = "liquid"))]
 struct IndexedBlock<R> {
     next_txnum: TxNum,
     rows: Vec<R>,
 }
 
+#[cfg(not(feature = "liquid"))]
 impl<R> IndexedBlock<R> {
     fn new(next_txnum: TxNum) -> Self {
         Self {
@@ -195,10 +211,15 @@ pub struct Batch {
     pub txid_rows: Vec<HashPrefixRow>,
     pub txpos_rows: Vec<txpos::TxBlockPosRow>,
     pub header: IndexedHeader,
+    /// Raw header bytes (stored in the row on Bitcoin, discarded on Liquid).
+    pub raw_header: Vec<u8>,
 }
 
 impl Batch {
+    /// Bitcoin: zero-copy visitors over the raw block.
+    #[cfg(not(feature = "liquid"))]
     pub fn build(
+        height: u32,
         txnum_range: TxNumRange,
         blockhash: BlockHash,
         block: &BlockBytes,
@@ -218,7 +239,51 @@ impl Batch {
             scripthash_rows: scripthash.rows,
             txpos_rows: txpos.rows,
             txid_rows: txid.rows,
-            header: IndexedHeader::new(txnum_range.next, blockhash, block),
+            header: IndexedHeader::from_block(height, txnum_range.next, blockhash, block),
+            raw_header: block.header().to_vec(),
+        })
+    }
+
+    /// Liquid: one full parse of the block through `fmt::walk_block`, then the
+    /// same three row sets. Spent outputs arrive in Bitcoin TxOut encoding from
+    /// the REST shim, so that parser is shared.
+    #[cfg(feature = "liquid")]
+    pub fn build(
+        height: u32,
+        txnum_range: TxNumRange,
+        blockhash: BlockHash,
+        block: &BlockBytes,
+        spent: &SpentBytes,
+    ) -> Result<Self, Error> {
+        let (_header_len, txs) = crate::fmt::walk_block(block.as_bytes())?;
+        let mut scripthash_rows = Vec::new();
+        let mut txid_rows = Vec::with_capacity(txs.len());
+        let mut positions = Vec::with_capacity(txs.len());
+        let mut txnum = txnum_range.first;
+        for tx in &txs {
+            for script in &tx.scripts {
+                scripthash::add_script(&mut scripthash_rows, txnum, bitcoin::Script::from_bytes(script));
+            }
+            txid_rows.push(HashPrefixRow::new(tx.txid.as_raw_hash().to_owned().into(), txnum));
+            positions.push((
+                txnum,
+                txpos::TxBlockPos {
+                    offset: tx.offset,
+                    size: tx.size,
+                },
+            ));
+            txnum.increment_by(1);
+        }
+        let spent_next = scripthash::add_spent_rows(spent, txnum_range.first, &mut scripthash_rows)?;
+        assert_eq!(txnum_range.next, txnum, "block tx count mismatch");
+        assert_eq!(txnum_range.next, spent_next, "spent tx count mismatch");
+
+        Ok(Batch {
+            scripthash_rows,
+            txpos_rows: txpos::TxBlockPosRow::chunkify(&positions),
+            txid_rows,
+            header: IndexedHeader::from_block(height, txnum_range.next, blockhash, block),
+            raw_header: block.header().to_vec(),
         })
     }
 }
