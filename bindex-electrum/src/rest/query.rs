@@ -3,10 +3,7 @@
 
 use std::str::FromStr;
 
-use bitcoin::{
-    consensus::deserialize, Address, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction,
-    TxOut, Txid,
-};
+use bitcoin::{BlockHash, OutPoint, ScriptBuf, Txid};
 use serde_json::Value;
 
 use crate::{
@@ -14,6 +11,7 @@ use crate::{
     deadline::Deadline,
     protocol::ElectrumScripthash,
     rest::{
+        format::{self, Tx, TxOut},
         http::HttpRequest,
         types::{TransactionStatus, TransactionValue},
         HttpError, RestApi, Result,
@@ -60,6 +58,7 @@ pub fn tip_height(api: &RestApi) -> Result<usize> {
         .ok_or_else(|| HttpError::server_error("chain has no headers"))
 }
 
+#[cfg(not(feature = "liquid"))]
 pub fn block_time(api: &RestApi, height: usize) -> Result<u32> {
     let header = api
         .server
@@ -69,9 +68,23 @@ pub fn block_time(api: &RestApi, height: usize) -> Result<u32> {
     Ok(header.time)
 }
 
+#[cfg(feature = "liquid")]
+pub fn block_time(api: &RestApi, height: usize) -> Result<u32> {
+    let raw = api
+        .server
+        .chain()
+        .header_raw_at_height(height)?
+        .ok_or_else(|| HttpError::not_found("Block not found"))?;
+    crate::rest::types::header_time(&raw).map_err(HttpError::server_error)
+}
+
+fn decode(raw: &[u8], what: impl std::fmt::Display) -> Result<Tx> {
+    format::decode_tx(raw).map_err(|err| HttpError::server_error(format!("decode {what}: {err}")))
+}
+
 /// A transaction plus where it lives.
 pub struct FoundTx {
-    pub tx: Transaction,
+    pub tx: Tx,
     pub raw: Vec<u8>,
     pub status: TransactionStatus,
     /// Index within its block, for confirmed transactions.
@@ -81,8 +94,7 @@ pub struct FoundTx {
 /// Look a transaction up in the chain index, then in the mempool.
 pub fn find_tx(api: &RestApi, txid: &Txid) -> Result<Option<FoundTx>> {
     if let Some(located) = api.server.chain().located_transaction_by_txid(txid)? {
-        let tx: Transaction = deserialize(&located.raw)
-            .map_err(|err| HttpError::server_error(format!("decode {txid}: {err}")))?;
+        let tx = decode(&located.raw, txid)?;
         let block_hash = parse_block_hash(&located.block_hash)?;
         let status = TransactionStatus::confirmed(
             located.height,
@@ -104,8 +116,7 @@ pub fn find_tx(api: &RestApi, txid: &Txid) -> Result<Option<FoundTx>> {
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let tx: Transaction = deserialize(&raw)
-        .map_err(|err| HttpError::server_error(format!("decode mempool {txid}: {err}")))?;
+    let tx = decode(&raw, format_args!("mempool {txid}"))?;
     Ok(Some(FoundTx {
         tx,
         raw,
@@ -127,29 +138,50 @@ pub fn prevout(api: &RestApi, outpoint: &OutPoint) -> Result<Option<TxOut>> {
             .chain()
             .transaction_by_txid(&outpoint.txid)?,
     };
+    #[cfg(feature = "liquid")]
+    let raw = match raw {
+        Some(raw) => Some(raw),
+        // Outside the index (a pruned-region stub, or not indexed yet): the
+        // node answers for any transaction when it runs with -txindex.
+        None => match api.core.tx_raw(&outpoint.txid) {
+            Ok(raw) => Some(raw),
+            Err(corerest::Error::NotFound) => None,
+            Err(err) => return Err(HttpError::server_error(err.to_string())),
+        },
+    };
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let tx: Transaction = deserialize(&raw)
-        .map_err(|err| HttpError::server_error(format!("decode {}: {err}", outpoint.txid)))?;
-    Ok(tx.output.get(outpoint.vout as usize).cloned())
+    let tx = decode(&raw, outpoint.txid)?;
+    Ok(format::output(&tx, outpoint.vout).cloned())
 }
 
-/// One entry per input; `None` where the previous output could not be found.
-pub fn resolve_prevouts(api: &RestApi, tx: &Transaction) -> Result<Vec<Option<TxOut>>> {
-    if tx.is_coinbase() {
-        return Ok(vec![None; tx.input.len()]);
-    }
-    tx.input
+/// One entry per input; `None` where the input has no prevout (the coinbase,
+/// a peg-in) or where it could not be found.
+pub fn resolve_prevouts(api: &RestApi, tx: &Tx) -> Result<Vec<Option<TxOut>>> {
+    format::prevout_outpoints(tx)
         .iter()
-        .map(|txin| prevout(api, &txin.previous_output))
+        .map(|outpoint| match outpoint {
+            Some(outpoint) => prevout(api, outpoint),
+            None => Ok(None),
+        })
         .collect()
+}
+
+/// Whether an input that has a prevout came back without one.
+pub fn missing_prevouts(tx: &Tx, prevouts: &[Option<TxOut>]) -> bool {
+    format::prevout_outpoints(tx)
+        .iter()
+        .enumerate()
+        .any(|(index, outpoint)| {
+            outpoint.is_some() && prevouts.get(index).is_none_or(Option::is_none)
+        })
 }
 
 /// Full transaction JSON. Missing prevouts are the reference's 500.
 pub fn tx_value(api: &RestApi, found: &FoundTx) -> Result<TransactionValue> {
     let prevouts = resolve_prevouts(api, &found.tx)?;
-    if !found.tx.is_coinbase() && prevouts.iter().any(Option::is_none) {
+    if missing_prevouts(&found.tx, &prevouts) {
         return Err(HttpError::server_error("Transaction missing prevouts").cached(0));
     }
     Ok(TransactionValue::new(
@@ -196,36 +228,133 @@ pub fn block_txids(json: &Value) -> Result<Vec<Txid>> {
         .collect()
 }
 
-/// Every transaction of a block with the outputs it spends, in block order.
+fn block_raw(api: &RestApi, hash: &BlockHash) -> Result<Vec<u8>> {
+    api.core.block_raw(hash).map_err(|err| match err {
+        corerest::Error::NotFound => HttpError::not_found("Block not found"),
+        other => HttpError::server_error(other.to_string()),
+    })
+}
+
+fn decode_block(raw: &[u8], hash: &BlockHash) -> Result<Vec<Tx>> {
+    format::decode_block_txs(raw)
+        .map_err(|err| HttpError::server_error(format!("decode block {hash}: {err}")))
+}
+
+/// The transactions of a block in `range`, each with its prevouts.
 ///
 /// Two REST round trips for the whole block: the block itself and
 /// `/rest/spenttxouts`, which is exactly the prevout set the transaction JSON
 /// needs (and what bindex already indexes blocks from).
-pub fn block_transactions(
+#[cfg(not(feature = "liquid"))]
+fn block_transactions(
     api: &RestApi,
     hash: &BlockHash,
-) -> Result<(Vec<Transaction>, Vec<Vec<TxOut>>)> {
-    let raw = api.core.block_raw(hash).map_err(|err| match err {
-        corerest::Error::NotFound => HttpError::not_found("Block not found"),
-        other => HttpError::server_error(other.to_string()),
-    })?;
-    let block: Block = deserialize(&raw)
-        .map_err(|err| HttpError::server_error(format!("decode block {hash}: {err}")))?;
+    range: std::ops::Range<usize>,
+    _deadline: &Deadline,
+) -> Result<Vec<(Tx, Vec<Option<TxOut>>)>> {
+    let txs = decode_block(&block_raw(api, hash)?, hash)?;
     let spent_bytes = api.core.spent_txouts(hash)?;
     let spent = corerest::parse_spent_txouts(&spent_bytes)
         .map_err(|err| HttpError::server_error(err.to_string()))?;
-    if spent.len() != block.txdata.len() {
+    if spent.len() != txs.len() {
         return Err(HttpError::server_error(format!(
             "block {hash} has {} transactions but {} spent-output lists",
-            block.txdata.len(),
+            txs.len(),
             spent.len()
         )));
     }
-    Ok((block.txdata, spent))
+    let end = range.end.min(txs.len());
+    let start = range.start.min(end);
+    Ok(txs
+        .into_iter()
+        .zip(spent)
+        .skip(start)
+        .take(end - start)
+        .map(|(tx, spent)| {
+            let prevouts = align_prevouts(&tx, &spent);
+            (tx, prevouts)
+        })
+        .collect())
 }
 
-/// Build the JSON for every transaction of a block, using the block's own
-/// spent-output stream for prevouts.
+#[cfg(not(feature = "liquid"))]
+fn align_prevouts(tx: &Tx, spent: &[TxOut]) -> Vec<Option<TxOut>> {
+    if tx.is_coinbase() {
+        return vec![None; tx.input.len()];
+    }
+    (0..tx.input.len())
+        .map(|index| spent.get(index).cloned())
+        .collect()
+}
+
+/// The transactions of a block in `range`, each with its prevouts.
+///
+/// The node's `spenttxouts` cannot serve Liquid: its prevouts would need the
+/// asset and value commitments, which `getblock 3` does not report for a
+/// blinded output. So each prevout comes from its funding transaction: from
+/// this block when it is spent in the block that created it, otherwise through
+/// the txid index, one lookup per funding transaction.
+#[cfg(feature = "liquid")]
+fn block_transactions(
+    api: &RestApi,
+    hash: &BlockHash,
+    range: std::ops::Range<usize>,
+    deadline: &Deadline,
+) -> Result<Vec<(Tx, Vec<Option<TxOut>>)>> {
+    use std::collections::{hash_map::Entry, HashMap};
+
+    let txs = decode_block(&block_raw(api, hash)?, hash)?;
+    let in_block: HashMap<Txid, usize> = txs
+        .iter()
+        .enumerate()
+        .map(|(index, tx)| (format::txid(tx), index))
+        .collect();
+    let end = range.end.min(txs.len());
+    let start = range.start.min(end);
+    let mut funding: HashMap<Txid, Option<Tx>> = HashMap::new();
+    let mut out = Vec::with_capacity(end - start);
+    for tx in &txs[start..end] {
+        check_deadline(deadline)?;
+        let mut prevouts = Vec::with_capacity(tx.input.len());
+        for outpoint in format::prevout_outpoints(tx) {
+            let Some(outpoint) = outpoint else {
+                prevouts.push(None);
+                continue;
+            };
+            let prevout = match in_block.get(&outpoint.txid) {
+                Some(index) => format::output(&txs[*index], outpoint.vout).cloned(),
+                None => {
+                    let found = match funding.entry(outpoint.txid) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => entry.insert(funding_tx(api, &outpoint.txid)?),
+                    };
+                    found
+                        .as_ref()
+                        .and_then(|tx| format::output(tx, outpoint.vout).cloned())
+                }
+            };
+            prevouts.push(prevout);
+        }
+        out.push((tx.clone(), prevouts));
+    }
+    Ok(out)
+}
+
+/// A confirmed funding transaction, from the index or (see `prevout`) the node.
+#[cfg(feature = "liquid")]
+fn funding_tx(api: &RestApi, txid: &Txid) -> Result<Option<Tx>> {
+    let raw = match api.server.chain().transaction_by_txid(txid)? {
+        Some(raw) => raw,
+        None => match api.core.tx_raw(txid) {
+            Ok(raw) => raw,
+            Err(corerest::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(HttpError::server_error(err.to_string())),
+        },
+    };
+    decode(&raw, txid).map(Some)
+}
+
+/// Build the JSON for the transactions of a block in `range`.
 pub fn block_tx_values(
     api: &RestApi,
     hash: &BlockHash,
@@ -233,34 +362,21 @@ pub fn block_tx_values(
     range: std::ops::Range<usize>,
     deadline: &Deadline,
 ) -> Result<Vec<TransactionValue>> {
-    let (txs, spent) = block_transactions(api, hash)?;
-    let end = range.end.min(txs.len());
     let mut out = Vec::new();
-    for index in range.start.min(end)..end {
+    for (tx, prevouts) in block_transactions(api, hash, range, deadline)? {
         check_deadline(deadline)?;
-        let tx = &txs[index];
-        let prevouts = align_prevouts(tx, &spent[index]);
-        if !tx.is_coinbase() && prevouts.iter().any(Option::is_none) {
+        if missing_prevouts(&tx, &prevouts) {
             // the reference drops such transactions from list endpoints
             continue;
         }
         out.push(TransactionValue::new(
-            tx,
+            &tx,
             &prevouts,
             status.clone(),
             api.network,
         ));
     }
     Ok(out)
-}
-
-fn align_prevouts(tx: &Transaction, spent: &[TxOut]) -> Vec<Option<TxOut>> {
-    if tx.is_coinbase() {
-        return vec![None; tx.input.len()];
-    }
-    (0..tx.input.len())
-        .map(|index| spent.get(index).cloned())
-        .collect()
 }
 
 /// An address or a REST scripthash from the path, with the label the response
@@ -301,7 +417,9 @@ impl ScriptKey {
     }
 }
 
-pub fn address_key(value: &str, network: Network) -> Result<ScriptKey> {
+#[cfg(not(feature = "liquid"))]
+pub fn address_key(value: &str, network: bitcoin::Network) -> Result<ScriptKey> {
+    use bitcoin::Address;
     let address = Address::from_str(value)
         .map_err(|_| HttpError::bad_request("Invalid Bitcoin address"))?;
     if !network_accepts(&address, network) {
@@ -319,9 +437,24 @@ pub fn scripthash_key(value: &str) -> Result<ScriptKey> {
     Ok(ScriptKey::Scripthash(value.to_ascii_lowercase()))
 }
 
+/// A Liquid address, confidential or not, for this chain's address params.
+/// A parse failure reports the parser's own text, as the reference does.
+#[cfg(feature = "liquid")]
+pub fn address_key(value: &str, params: format::Params) -> Result<ScriptKey> {
+    let address = elements::Address::parse_with_params(value, params.address)
+        .map_err(|err| HttpError::bad_request(err.to_string()))?;
+    let script = ScriptBuf::from_bytes(address.script_pubkey().into_bytes());
+    Ok(ScriptKey::Address(value.to_string(), script))
+}
+
 /// Mainnet addresses only on mainnet; the test networks accept each other, as
 /// the reference does.
-fn network_accepts(address: &Address<bitcoin::address::NetworkUnchecked>, network: Network) -> bool {
+#[cfg(not(feature = "liquid"))]
+fn network_accepts(
+    address: &bitcoin::Address<bitcoin::address::NetworkUnchecked>,
+    network: bitcoin::Network,
+) -> bool {
+    use bitcoin::Network;
     let candidates: &[Network] = match network {
         Network::Bitcoin => &[Network::Bitcoin],
         _ => &[
@@ -339,6 +472,8 @@ fn network_accepts(address: &Address<bitcoin::address::NetworkUnchecked>, networ
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "liquid"))]
+    use bitcoin::Network;
 
     #[test]
     fn scripthash_key_round_trips_through_the_electrum_form() {
@@ -365,6 +500,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "liquid"))]
     #[test]
     fn addresses_are_checked_against_the_network() {
         assert!(address_key("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", Network::Bitcoin).is_ok());

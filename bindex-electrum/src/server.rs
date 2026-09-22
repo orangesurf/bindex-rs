@@ -54,9 +54,7 @@ struct TorPush {
     package: PushTarget,
 }
 
-/// Shared state accessors for the REST API (unused in the liquid build, which
-/// compiles the REST module out).
-#[cfg_attr(feature = "liquid", allow(dead_code))]
+/// Shared state accessors for the REST API.
 impl Server {
     pub(crate) fn config(&self) -> &Config {
         &self.state.config
@@ -118,7 +116,6 @@ impl Server {
         self.spawn_secondary_refresh_task();
         self.spawn_mempool_poll_task();
 
-        #[cfg(not(feature = "liquid"))]
         if let Some(addr) = self.state.config.rest.http_addr {
             let server = self.clone();
             tokio::spawn(async move {
@@ -179,7 +176,7 @@ impl Server {
         if self.state.config.rest.http_addr.is_none() {
             return;
         }
-        let core = crate::corerest::CoreRest::new(self.state.config.bitcoind_rest_url.clone());
+        let core = crate::rest::rest_core(self, self.state.config.bitcoind_rest_url.clone());
         let interval = self.state.config.mempool_poll_interval();
         let recent_cap = self.state.config.rest.mempool_recent_txs_size;
         let server = self.clone();

@@ -210,6 +210,13 @@ pub struct RestConfig {
     /// Largest REST request body accepted.
     #[arg(long, default_value_t = 20_000_200)]
     pub request_body_bytes_cap: usize,
+
+    /// Esplora API that `/asset*` and `/assets*` are proxied to (e.g.
+    /// `https://liquid.network/api`): there is no asset index here. Unset,
+    /// those routes answer 404.
+    #[cfg(feature = "liquid")]
+    #[arg(long)]
+    pub asset_upstream: Option<String>,
 }
 
 impl Default for RestConfig {
@@ -233,6 +240,8 @@ impl Default for RestConfig {
             rest_header_timeout_secs: 10,
             rest_idle_timeout_secs: 30,
             request_body_bytes_cap: 20_000_200,
+            #[cfg(feature = "liquid")]
+            asset_upstream: None,
         }
     }
 }
@@ -297,8 +306,9 @@ impl Config {
         if self.secondary_refresh_ms == 0 {
             anyhow::bail!("secondary-refresh-ms must be positive");
         }
-        if self.rest.http_addr.is_some() && cfg!(feature = "liquid") {
-            anyhow::bail!("--http-addr is not supported by the liquid build");
+        if self.rest.http_addr.is_some() {
+            // the REST shapes need to know the chain the index is of
+            crate::rest::format::params(self.network)?;
         }
         if self.broadcast_via == BroadcastVia::Tor {
             self.tor_broadcast_target()?;

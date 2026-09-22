@@ -35,6 +35,7 @@ pub struct MempoolTx {
 
 impl MempoolTx {
     /// Total value of the transaction's outputs.
+    #[cfg_attr(feature = "liquid", allow(dead_code))]
     pub fn value(&self) -> u64 {
         self.outputs.values().map(|(_, value)| value).sum()
     }
@@ -46,6 +47,8 @@ pub struct RecentTx {
     pub txid: String,
     pub fee: u64,
     pub vsize: u64,
+    /// Not reported on Liquid, where output values are mostly blinded.
+    #[cfg(not(feature = "liquid"))]
     pub value: u64,
 }
 
@@ -405,6 +408,7 @@ pub fn poll_once(
             txid: tx.txid.to_string(),
             fee: tx.fee,
             vsize: tx.vsize,
+            #[cfg(not(feature = "liquid"))]
             value: tx.value(),
         };
         index.insert(tx);
@@ -464,6 +468,7 @@ mod tests {
                     txid: i.to_string(),
                     fee: i as u64,
                     vsize: 1,
+                    #[cfg(not(feature = "liquid"))]
                     value: 1,
                 },
                 3,

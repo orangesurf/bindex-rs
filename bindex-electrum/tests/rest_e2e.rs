@@ -191,7 +191,7 @@ async fn rest_api_serves_a_regtest_chain() -> anyhow::Result<()> {
 
     let server = Server::new(config)?;
     server.spawn_mempool_poll_task();
-    let api = RestApi::new(server.clone());
+    let api = RestApi::new(server.clone()).unwrap();
     let rest_task = tokio::spawn(rest::run_listener(api, http));
     let electrum_task =
         tokio::spawn(server.run_tcp_listener_until_shutdown(electrum, future::pending()));
@@ -838,7 +838,7 @@ async fn tor_mode_refuses_local_submission_and_the_utxo_cap_is_historical(
     let http = TcpListener::bind("127.0.0.1:0").await?;
     let addr = http.local_addr()?;
     let server = Server::new(config)?;
-    let rest_task = tokio::spawn(rest::run_listener(RestApi::new(server), http));
+    let rest_task = tokio::spawn(rest::run_listener(RestApi::new(server).unwrap(), http));
 
     // the address holds nothing now, but once held two, so the cap applies
     let stats = get_ok(addr, &format!("/address/{hot}")).await?.json();

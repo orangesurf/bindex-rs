@@ -178,6 +178,7 @@ dependencies = [
  "bitcoin",
  "clap",
  "corepc-node",
+ "elements",
  "env_logger",
  "hex",
  "log",
@@ -592,6 +593,7 @@ dependencies = [
  "bech32",
  "bitcoin",
  "secp256k1-zkp",
+ "serde",
 ]
 
 [[package]]
@@ -1406,6 +1408,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -1473,6 +1476,7 @@ dependencies = [
  "rand",
  "secp256k1",
  "secp256k1-zkp-sys",
+ "serde",
 ]
 
 [[package]]
@@ -1795,10 +1799,13 @@ dependencies = [
  "cookie_store",
  "log",
  "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "ureq-proto",
  "utf8-zero",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1911,6 +1918,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

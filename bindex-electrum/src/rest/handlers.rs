@@ -1,21 +1,24 @@
 //! Route table and handlers.
 
-use bitcoin::{OutPoint, Transaction, Txid};
+use bitcoin::{OutPoint, Txid};
 use serde_json::Value;
 
+#[cfg(not(feature = "liquid"))]
+use crate::rest::types::merkleblock_hex;
 use crate::{
     deadline::Deadline,
     merkle,
     protocol::ElectrumScripthash,
     rest::{
         address,
+        format::{self, Tx},
         http::HttpResponse,
         json,
         query::{self, FoundTx},
         text,
         types::{
-            merkleblock_hex, BlockStatus, BlockValue, MempoolInfo, MerkleProof, SpendingValue,
-            TransactionStatus, TransactionValue,
+            BlockStatus, BlockValue, MempoolInfo, MerkleProof, SpendingValue, TransactionStatus,
+            TransactionValue,
         },
         ttl_by_depth, HttpError, Req, RestApi, Result, TTL_LONG, TTL_SHORT,
     },
@@ -51,6 +54,8 @@ pub async fn route(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
         ("POST", ["txs", "test"]) => return txs_test(api, request).await,
         ("POST", ["txs", "package"]) => return txs_package(api, request).await,
         ("GET", ["fee-estimates"]) => return fee_estimates(api).await,
+        #[cfg(feature = "liquid")]
+        ("GET", ["asset" | "assets", ..]) => return crate::rest::assets::proxy(api, request).await,
         _ => {}
     }
     tokio::task::block_in_place(|| route_blocking(api, request, &segments))
@@ -102,6 +107,7 @@ fn route_blocking(
         ("GET", ["tx", txid, "raw"]) => tx_raw(api, txid),
         ("GET", ["tx", txid, "status"]) => tx_status(api, txid),
         ("GET", ["tx", txid, "merkle-proof"]) => tx_merkle_proof(api, txid),
+        #[cfg(not(feature = "liquid"))]
         ("GET", ["tx", txid, "merkleblock-proof"]) => tx_merkleblock_proof(api, txid),
         ("GET", ["tx", txid, "outspend", vout]) => tx_outspend(api, request, txid, vout),
         ("GET", ["tx", txid, "outspends"]) => tx_outspends(api, request, txid),
@@ -201,8 +207,16 @@ fn block_height(api: &RestApi, height: &str) -> Result<HttpResponse> {
 
 fn block(api: &RestApi, hash: &str) -> Result<HttpResponse> {
     let hash = query::parse_block_hash(hash)?;
+    #[allow(unused_mut)]
+    let mut value = block_value(api, &hash)?;
+    // Liquid shows the header's extension data here, and only here
+    #[cfg(feature = "liquid")]
+    {
+        let raw = api.core.header_raw(&hash).map_err(map_block_error)?;
+        value.ext = Some(crate::rest::types::header_ext(&raw).map_err(HttpError::server_error)?);
+    }
     // TTL_LONG unconditionally, even for the tip and for orphans
-    json(&block_value(api, &hash)?, TTL_LONG)
+    json(&value, TTL_LONG)
 }
 
 fn block_status(api: &RestApi, hash: &str) -> Result<HttpResponse> {
@@ -404,6 +418,7 @@ fn tx_merkle_proof(api: &RestApi, txid: &str) -> Result<HttpResponse> {
     )
 }
 
+#[cfg(not(feature = "liquid"))]
 fn tx_merkleblock_proof(api: &RestApi, txid: &str) -> Result<HttpResponse> {
     let txid = query::parse_txid(txid)?;
     let (height, txids, _) = confirmed_block_position(api, &txid)?;
@@ -557,14 +572,14 @@ fn outspend(
     let Some(found) = query::find_tx(api, txid)? else {
         return Ok(SpendingValue::unspent());
     };
-    let Some(output) = found.tx.output.get(vout as usize) else {
+    let Some(output) = format::output(&found.tx, vout) else {
         return Ok(SpendingValue::unspent());
     };
-    let script = output.script_pubkey.as_script();
-    if script.is_empty() || script.is_op_return() {
+    if format::is_unspendable(output) {
         // never indexed, and unspendable anyway
         return Ok(SpendingValue::unspent());
     }
+    let script = bitcoin::Script::from_bytes(format::output_script(output));
     let outpoint = OutPoint { txid: *txid, vout };
 
     let mempool_spender = {
@@ -577,13 +592,9 @@ fn outspend(
         })
     };
     if let Some((spender, raw)) = mempool_spender {
-        let tx: Transaction = bitcoin::consensus::deserialize(&raw)
+        let tx = format::decode_tx(&raw)
             .map_err(|err| HttpError::server_error(format!("decode {spender}: {err}")))?;
-        let vin = tx
-            .input
-            .iter()
-            .position(|input| input.previous_output == outpoint)
-            .unwrap_or(0) as u32;
+        let vin = format::spending_input(&tx, &outpoint).unwrap_or(0);
         return Ok(SpendingValue::spent(
             spender,
             vin,
@@ -614,10 +625,10 @@ fn outspend(
 fn outspends_of(
     api: &RestApi,
     txid: &Txid,
-    tx: &Transaction,
+    tx: &Tx,
     deadline: &Deadline,
 ) -> Result<Vec<SpendingValue>> {
-    (0..tx.output.len() as u32)
+    (0..format::output_count(tx) as u32)
         .map(|vout| outspend(api, txid, vout, deadline))
         .collect()
 }

@@ -5,14 +5,20 @@
 //! the JSON literally. `Option` fields that the reference omits when empty
 //! carry `skip_serializing_if`; the ones it emits as `null` do not.
 
+#[cfg(not(feature = "liquid"))]
 use bitcoin::{
-    consensus::Encodable as _, hashes::Hash as _, Address, Network, OutPoint, Script, Transaction,
-    TxIn, TxOut, Txid,
+    consensus::Encodable as _, Address, Network, OutPoint, Transaction, TxIn, TxOut,
 };
+use bitcoin::{hashes::Hash as _, Script, Txid};
 use serde::Serialize;
+#[cfg(not(feature = "liquid"))]
 use serde_json::Value;
 
+#[cfg(feature = "liquid")]
+pub use super::liquid_types::*;
+
 /// Anchor output (`OP_1 OP_PUSHBYTES_2 4e73`), P2A.
+#[cfg(not(feature = "liquid"))]
 const ANCHOR_SCRIPT: [u8; 4] = [0x51, 0x02, 0x4e, 0x73];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -50,6 +56,7 @@ impl TransactionStatus {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TxOutValue {
     pub scriptpubkey: String,
@@ -60,6 +67,7 @@ pub struct TxOutValue {
     pub value: u64,
 }
 
+#[cfg(not(feature = "liquid"))]
 impl TxOutValue {
     pub fn new(txout: &TxOut, network: Network) -> Self {
         let script = txout.script_pubkey.as_script();
@@ -73,6 +81,7 @@ impl TxOutValue {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TxInValue {
     pub txid: String,
@@ -91,6 +100,7 @@ pub struct TxInValue {
     pub inner_witnessscript_asm: Option<String>,
 }
 
+#[cfg(not(feature = "liquid"))]
 impl TxInValue {
     pub fn new(txin: &TxIn, prevout: Option<&TxOut>, network: Network) -> Self {
         let is_coinbase = txin.previous_output.is_null();
@@ -113,6 +123,7 @@ impl TxInValue {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TransactionValue {
     pub txid: String,
@@ -127,6 +138,7 @@ pub struct TransactionValue {
     pub status: TransactionStatus,
 }
 
+#[cfg(not(feature = "liquid"))]
 impl TransactionValue {
     /// `prevouts` must hold one entry per non-coinbase input, keyed by input index.
     pub fn new(
@@ -173,6 +185,7 @@ impl TransactionValue {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 fn lookup_prevout(tx: &Transaction, prevouts: &[Option<TxOut>], outpoint: &OutPoint) -> Option<TxOut> {
     tx.input
         .iter()
@@ -181,6 +194,7 @@ fn lookup_prevout(tx: &Transaction, prevouts: &[Option<TxOut>], outpoint: &OutPo
         .and_then(Clone::clone)
 }
 
+#[cfg(not(feature = "liquid"))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BlockValue {
     pub id: String,
@@ -199,6 +213,7 @@ pub struct BlockValue {
     pub difficulty: f64,
 }
 
+#[cfg(not(feature = "liquid"))]
 impl BlockValue {
     /// Build from bitcoind's `/rest/block/notxdetails/<hash>.json`.
     pub fn from_core_json(json: &Value) -> Option<Self> {
@@ -233,6 +248,7 @@ pub struct BlockStatus {
     pub next_best: Option<String>,
 }
 
+#[cfg(not(feature = "liquid"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UtxoValue {
     pub txid: String,
@@ -272,6 +288,7 @@ impl SpendingValue {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ScriptStats {
     pub tx_count: usize,
@@ -279,6 +296,31 @@ pub struct ScriptStats {
     pub spent_txo_count: usize,
     pub funded_txo_sum: u64,
     pub spent_txo_sum: u64,
+}
+
+#[cfg(not(feature = "liquid"))]
+impl ScriptStats {
+    pub fn new(
+        tx_count: usize,
+        funded_txo_count: usize,
+        spent_txo_count: usize,
+        funded_txo_sum: u64,
+        spent_txo_sum: u64,
+    ) -> Self {
+        Self {
+            tx_count,
+            funded_txo_count,
+            spent_txo_count,
+            funded_txo_sum,
+            spent_txo_sum,
+        }
+    }
+}
+
+/// `/address/:a/txs/summary`'s net value for one transaction.
+#[cfg(not(feature = "liquid"))]
+pub fn summary_value(funded: u64, spent: u64) -> i64 {
+    funded as i64 - spent as i64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -313,6 +355,7 @@ pub struct MerkleProof {
     pub pos: usize,
 }
 
+#[cfg(not(feature = "liquid"))]
 /// `scriptpubkey_type`, using the reference's vocabulary.
 pub fn script_type(script: &Script) -> &'static str {
     if script.is_empty() {
@@ -340,6 +383,7 @@ pub fn script_type(script: &Script) -> &'static str {
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 /// The address for a script, when one exists for this network.
 pub fn script_address(script: &Script, network: Network) -> Option<String> {
     Address::from_script(script, network)
@@ -347,6 +391,7 @@ pub fn script_address(script: &Script, network: Network) -> Option<String> {
         .map(|address| address.to_string())
 }
 
+#[cfg(not(feature = "liquid"))]
 fn inner_scripts(txin: &TxIn, prevout: Option<&TxOut>) -> (Option<String>, Option<String>) {
     let Some(prevout) = prevout else {
         return (None, None);
@@ -369,6 +414,7 @@ fn inner_scripts(txin: &TxIn, prevout: Option<&TxOut>) -> (Option<String>, Optio
     }
 }
 
+#[cfg(not(feature = "liquid"))]
 fn last_scriptsig_push(txin: &TxIn) -> Option<Vec<u8>> {
     let mut last = None;
     for instruction in txin.script_sig.instructions() {
@@ -383,6 +429,7 @@ fn last_scriptsig_push(txin: &TxIn) -> Option<Vec<u8>> {
     last
 }
 
+#[cfg(not(feature = "liquid"))]
 fn last_witness_script_asm(txin: &TxIn) -> Option<String> {
     txin.witness
         .last()

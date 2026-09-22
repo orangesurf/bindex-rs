@@ -24,6 +24,11 @@ pub enum Error {
 pub struct CoreRest {
     agent: ureq::Agent,
     url: String,
+    /// Liquid: Elements answers the metadata, transaction and mempool reads
+    /// over RPC (the REST facade in front of it serves only what the indexer
+    /// needs).
+    #[cfg(feature = "liquid")]
+    rpc: Option<crate::bitcoind::RpcClient>,
 }
 
 impl CoreRest {
@@ -31,6 +36,31 @@ impl CoreRest {
         Self {
             agent: ureq::Agent::new_with_defaults(),
             url: url.trim_end_matches('/').to_string(),
+            #[cfg(feature = "liquid")]
+            rpc: None,
+        }
+    }
+
+    /// Read block metadata, transactions and the mempool over this RPC client.
+    #[cfg(feature = "liquid")]
+    pub fn with_rpc(mut self, rpc: crate::bitcoind::RpcClient) -> Self {
+        self.rpc = Some(rpc);
+        self
+    }
+
+    /// One RPC call, with "not found" (-5, -8) mapped to `NotFound`.
+    #[cfg(feature = "liquid")]
+    fn rpc(&self, method: &str, params: Value) -> Result<Option<Value>, Error> {
+        let Some(rpc) = &self.rpc else {
+            return Ok(None);
+        };
+        match rpc.call_sync(method, params) {
+            Ok(Ok(value)) => Ok(Some(value)),
+            Ok(Err(err)) => match err.get("code").and_then(Value::as_i64) {
+                Some(-5 | -8) => Err(Error::NotFound),
+                _ => Err(Error::Transport(format!("{method}: {err}"))),
+            },
+            Err(err) => Err(Error::Transport(err.to_string())),
         }
     }
 
@@ -55,6 +85,10 @@ impl CoreRest {
 
     /// Block metadata plus the txid list, without transaction bodies.
     pub fn block_json(&self, hash: &bitcoin::BlockHash) -> Result<Value, Error> {
+        #[cfg(feature = "liquid")]
+        if let Some(json) = self.rpc("getblock", serde_json::json!([hash.to_string(), 1]))? {
+            return Ok(json);
+        }
         self.get_json(&format!("/rest/block/notxdetails/{hash}.json"))
     }
 
@@ -89,11 +123,22 @@ impl CoreRest {
     /// transactions in the mempool, which is exactly what the REST API needs it
     /// for (confirmed bodies come from the index).
     pub fn tx_raw(&self, txid: &bitcoin::Txid) -> Result<Vec<u8>, Error> {
+        #[cfg(feature = "liquid")]
+        if let Some(hex) = self.rpc("getrawtransaction", serde_json::json!([txid.to_string(), false]))? {
+            let hex = hex
+                .as_str()
+                .ok_or_else(|| Error::Decode("getrawtransaction returned a non-string".into()))?;
+            return hex::decode(hex).map_err(|err| Error::Decode(err.to_string()));
+        }
         self.get_bytes(&format!("/rest/tx/{txid}.bin"))
     }
 
     /// `{ "<txid>": { fees: {base, ancestor, ...}, vsize, ... } }`
     pub fn mempool_contents(&self) -> Result<Value, Error> {
+        #[cfg(feature = "liquid")]
+        if let Some(json) = self.rpc("getrawmempool", serde_json::json!([true]))? {
+            return Ok(json);
+        }
         self.get_json("/rest/mempool/contents.json?verbose=true")
     }
 }

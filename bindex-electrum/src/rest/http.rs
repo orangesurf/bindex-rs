@@ -257,6 +257,8 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
     /// `Cache-Control: public, max-age=<ttl>` when present.
     pub cache_max_age: Option<u32>,
+    /// Relayed verbatim (the Liquid asset proxy passes some upstream headers on).
+    pub extra_headers: Vec<(&'static str, String)>,
 }
 
 impl HttpResponse {
@@ -266,6 +268,7 @@ impl HttpResponse {
             content_type: "text/plain",
             body: body.into().into_bytes(),
             cache_max_age,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -275,6 +278,7 @@ impl HttpResponse {
             content_type: "application/json",
             body,
             cache_max_age,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -284,6 +288,7 @@ impl HttpResponse {
             content_type: "application/octet-stream",
             body,
             cache_max_age,
+            extra_headers: Vec::new(),
         }
     }
 }
@@ -336,6 +341,12 @@ where
     }
     if let Some(ttl) = response.cache_max_age {
         head.push_str(&format!("Cache-Control: public, max-age={ttl}\r\n"));
+    }
+    for (name, value) in &response.extra_headers {
+        // an upstream value is relayed, never allowed to start a new header
+        if !value.contains(['\r', '\n']) {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
     }
     head.push_str(if keep_alive {
         "Connection: keep-alive\r\n\r\n"

@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use bitcoin::{BlockHash, Txid};
+use bitcoin::{BlockHash, OutPoint, Txid};
 use serde::Serialize;
 
 use crate::{
@@ -22,7 +22,10 @@ use crate::{
         http::HttpResponse,
         json,
         query::{self, ScriptKey},
-        types::{ScriptStats, TransactionStatus, TransactionValue, TxHistorySummary, UtxoValue},
+        types::{
+            summary_value, ScriptStats, TransactionStatus, TransactionValue, TxHistorySummary,
+            UtxoValue,
+        },
         HttpError, Req, RestApi, Result, TTL_SHORT,
     },
 };
@@ -132,13 +135,13 @@ fn multi_keys(api: &RestApi, request: &Req<'_>, prefix: &str) -> Result<Vec<Scri
 fn stats(api: &RestApi, key: ScriptKey, deadline: &Deadline) -> Result<HttpResponse> {
     let scripthash = key.electrum()?;
     let history = api.server.chain().script_history(scripthash, deadline)?;
-    let chain_stats = ScriptStats {
-        tx_count: history.tx_count(),
-        funded_txo_count: history.funded_txo_count,
-        spent_txo_count: history.spent_txo_count,
-        funded_txo_sum: history.funded_txo_sum,
-        spent_txo_sum: history.spent_txo_sum,
-    };
+    let chain_stats = ScriptStats::new(
+        history.tx_count(),
+        history.funded_txo_count,
+        history.spent_txo_count,
+        history.funded_txo_sum,
+        history.spent_txo_sum,
+    );
     let mempool_stats = mempool_stats(api, scripthash, &history);
     match key {
         ScriptKey::Address(address, _) => json(
@@ -266,7 +269,7 @@ fn txs_summary(
         summaries.push(TxHistorySummary {
             txid: row.txid.to_string(),
             height: row.height,
-            value: row.funded as i64 - row.spent as i64,
+            value: summary_value(row.funded, row.spent),
             time,
             tx_position: row.position.min(u16::MAX as u32) as u16,
         });
@@ -326,25 +329,56 @@ fn utxo(api: &RestApi, key: ScriptKey, deadline: &Deadline) -> Result<HttpRespon
                 entry
             }
         };
-        values.push(UtxoValue {
-            txid: outpoint.txid.to_string(),
-            vout: outpoint.vout,
-            status: TransactionStatus::confirmed(*height, &hash, time),
-            value: *value,
-        });
+        values.extend(utxo_value(
+            api,
+            *outpoint,
+            TransactionStatus::confirmed(*height, &hash, time),
+            *value,
+        )?);
     }
     for (outpoint, value) in mempool_outputs {
         if spent_in_mempool.contains(&outpoint) {
             continue;
         }
-        values.push(UtxoValue {
-            txid: outpoint.txid.to_string(),
-            vout: outpoint.vout,
-            status: TransactionStatus::unconfirmed(),
+        values.extend(utxo_value(
+            api,
+            outpoint,
+            TransactionStatus::unconfirmed(),
             value,
-        });
+        )?);
     }
     json(&values, TTL_SHORT)
+}
+
+#[cfg(not(feature = "liquid"))]
+fn utxo_value(
+    _api: &RestApi,
+    outpoint: OutPoint,
+    status: TransactionStatus,
+    value: u64,
+) -> Result<Option<UtxoValue>> {
+    Ok(Some(UtxoValue {
+        txid: outpoint.txid.to_string(),
+        vout: outpoint.vout,
+        status,
+        value,
+    }))
+}
+
+/// A Liquid UTXO carries its commitments, nonce and proofs, which only the
+/// funding output itself has, so each one costs a transaction fetch.
+#[cfg(feature = "liquid")]
+fn utxo_value(
+    api: &RestApi,
+    outpoint: OutPoint,
+    status: TransactionStatus,
+    _value: u64,
+) -> Result<Option<UtxoValue>> {
+    let Some(txout) = query::prevout(api, &outpoint)? else {
+        log::warn!("utxo {outpoint} has no funding transaction");
+        return Ok(None);
+    };
+    Ok(Some(UtxoValue::new(outpoint, status, &txout)))
 }
 
 // ---------------------------------------------------------------- shared
@@ -438,13 +472,13 @@ impl Histories {
 /// Mempool-side `ScriptStats` for one script.
 fn mempool_stats(api: &RestApi, scripthash: ElectrumScripthash, history: &ScriptHistory) -> ScriptStats {
     let mempool = api.server.mempool().read().expect("mempool lock");
-    let mut stats = ScriptStats::default();
+    let (mut funded_count, mut funded_sum, mut spent_count, mut spent_sum) = (0, 0, 0, 0);
     let mut txs = BTreeSet::new();
 
     let outputs = mempool.outputs_of(scripthash);
     for (outpoint, value) in &outputs {
-        stats.funded_txo_count += 1;
-        stats.funded_txo_sum += value;
+        funded_count += 1;
+        funded_sum += value;
         txs.insert(outpoint.txid);
     }
 
@@ -455,14 +489,13 @@ fn mempool_stats(api: &RestApi, scripthash: ElectrumScripthash, history: &Script
         .chain(outputs.iter().copied());
     for (outpoint, value) in candidates {
         if let Some(spender) = mempool.spender(&outpoint) {
-            stats.spent_txo_count += 1;
-            stats.spent_txo_sum += value;
+            spent_count += 1;
+            spent_sum += value;
             txs.insert(spender);
         }
     }
 
-    stats.tx_count = txs.len();
-    stats
+    ScriptStats::new(txs.len(), funded_count, spent_count, funded_sum, spent_sum)
 }
 
 fn tx_values(

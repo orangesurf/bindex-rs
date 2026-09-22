@@ -432,6 +432,15 @@ impl ChainAdapter {
             .block_hash_at_height(height))
     }
 
+    /// Raw header bytes of an active-chain block, in either format.
+    pub fn header_raw_at_height(&self, height: usize) -> Result<Option<Vec<u8>>, Error> {
+        self.chain
+            .read()
+            .map_err(|_| Error::Lock)?
+            .block_header_raw_at_height(height)
+            .map_err(Error::Bindex)
+    }
+
     /// Decoded header of an active-chain block (Bitcoin format only).
     #[cfg(not(feature = "liquid"))]
     pub fn header_at_height(&self, height: usize) -> Result<Option<bitcoin::block::Header>, Error> {

@@ -11,6 +11,7 @@ base64 = "0.22"
 bindex = { path = "../bindex-lib", features = ["bitcoin_serde"] }
 bitcoin = { version = "0.32", default-features = false, features = ["serde"] }
 clap = { version = "4", features = ["derive", "string"] }
+elements = { version = "0.26", optional = true, default-features = false, features = ["serde"] }
 env_logger = "0.11"
 hex = "0.4"
 log = "0.4"
@@ -24,7 +25,8 @@ tokio-rustls = "0.26"
 ureq = { version = "3", default-features = false, features = ["json"] }
 
 [features]
-liquid = ["bindex/liquid"]
+# ureq/rustls: the Liquid REST API proxies the asset routes to an HTTPS upstream
+liquid = ["bindex/liquid", "dep:elements", "ureq/rustls"]
 
 [dev-dependencies]
 corepc-node = { version = "0.12", default-features = false, features = ["30_0"] }

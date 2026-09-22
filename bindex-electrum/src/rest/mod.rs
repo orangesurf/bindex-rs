@@ -6,13 +6,19 @@
 //! route inventory, TTLs and error texts follow `mempool/electrs`, so the
 //! responses can be diffed against a real Esplora deployment.
 //!
-//! Bitcoin only: the whole module is compiled out of the `liquid` build, whose
-//! transactions are Elements-encoded and need a different set of shapes.
-#![cfg(not(feature = "liquid"))]
+//! The `liquid` build serves the electrs-liquid shapes from the same routes:
+//! `format` hides which transaction type is being read, `types` (with
+//! `liquid_types`) holds the per-chain response shapes, and `assets` proxies
+//! the asset routes, which have no index here.
 
 pub mod address;
+#[cfg(feature = "liquid")]
+pub mod assets;
+pub mod format;
 pub mod handlers;
 pub mod http;
+#[cfg(feature = "liquid")]
+pub mod liquid_types;
 pub mod query;
 pub mod types;
 
@@ -25,7 +31,6 @@ use std::{
 use tokio::sync::Semaphore;
 
 use anyhow::Context as _;
-use bitcoin::Network;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
@@ -168,7 +173,9 @@ pub fn text(value: impl Into<String>, ttl: u32) -> HttpResponse {
 pub struct RestApi {
     pub server: Server,
     pub core: CoreRest,
-    pub network: Network,
+    /// What the response shapes need to know about the chain; on Bitcoin just
+    /// the `Network`.
+    pub network: format::Params,
     pub config: RestConfig,
     identity: RwLock<IdentityHeaders>,
     fee_cache: Mutex<Option<(Instant, Value)>>,
@@ -182,7 +189,7 @@ pub struct RestApi {
 }
 
 impl RestApi {
-    pub fn new(server: Server) -> Arc<Self> {
+    pub fn new(server: Server) -> anyhow::Result<Arc<Self>> {
         let (network, rest, rest_url) = {
             let config = server.config();
             (
@@ -196,16 +203,16 @@ impl RestApi {
             cors: rest.cors,
             bitcoin_version: None,
         };
-        Arc::new(Self {
-            network,
+        Ok(Arc::new(Self {
+            network: format::params(network)?,
             queries: Semaphore::new(rest.rest_max_concurrent_queries.max(1)),
             connections: Arc::new(Semaphore::new(rest.rest_max_connections.max(1))),
             config: rest,
-            core: CoreRest::new(rest_url),
+            core: rest_core(&server, rest_url),
             identity: RwLock::new(identity),
             fee_cache: Mutex::new(None),
             server,
-        })
+        }))
     }
 
     fn identity(&self) -> IdentityHeaders {
@@ -294,13 +301,25 @@ impl RestApi {
     }
 }
 
+/// The node reads the REST API makes beyond what the index stores.
+pub(crate) fn rest_core(server: &Server, rest_url: String) -> CoreRest {
+    let core = CoreRest::new(rest_url);
+    // Elements serves these over RPC; its REST facade only has the indexer's
+    // endpoints
+    #[cfg(feature = "liquid")]
+    let core = core.with_rpc(server.bitcoind().clone());
+    #[cfg(not(feature = "liquid"))]
+    let _ = server;
+    core
+}
+
 /// Bind and serve until the task is dropped.
 pub async fn serve(server: Server, addr: SocketAddr) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind REST {addr}"))?;
     log::info!("esplora REST listening on {addr}");
-    let api = RestApi::new(server);
+    let api = RestApi::new(server)?;
     api.spawn_version_probe();
     run_listener(api, listener).await
 }

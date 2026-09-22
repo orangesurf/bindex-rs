@@ -88,6 +88,45 @@ impl RpcClient {
             .ok_or_else(|| Error::Rpc("missing JSON-RPC result".to_string()))
     }
 
+    /// A blocking call that keeps the node's error object: an RPC error comes
+    /// back as `Ok(Err(error))` rather than as an HTTP status, so callers can
+    /// tell "no such block" from a transport failure. Only for blocking contexts.
+    #[cfg(feature = "liquid")]
+    pub fn call_sync(&self, method: &str, params: Value) -> Result<Result<Value, Value>, Error> {
+        let request = json!({
+            "jsonrpc": "1.0",
+            "id": "bindex-electrum",
+            "method": method,
+            "params": params,
+        });
+        let mut builder = self
+            .agent
+            .post(&self.url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("Content-Type", "application/json");
+        if let Some((user, password)) = self.credentials()? {
+            use base64::Engine as _;
+            let auth =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            builder = builder.header("Authorization", format!("Basic {auth}"));
+        }
+        let mut response = builder.send_json(&request)?;
+        if response.status() == 401 {
+            return Err(Error::Auth("node refused the RPC credentials".to_string()));
+        }
+        let response: Value = response.body_mut().with_config().limit(1 << 30).read_json()?;
+        if let Some(err) = response.get("error").filter(|value| !value.is_null()) {
+            return Ok(Err(err.clone()));
+        }
+        response
+            .get("result")
+            .cloned()
+            .map(Ok)
+            .ok_or_else(|| Error::Rpc("missing JSON-RPC result".to_string()))
+    }
+
     fn credentials(&self) -> Result<Option<(String, String)>, Error> {
         if let (Some(user), Some(password)) = (&self.user, &self.password) {
             return Ok(Some((user.clone(), password.clone())));
