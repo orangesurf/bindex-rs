@@ -348,7 +348,8 @@ async fn handle_connection(api: Arc<RestApi>, stream: tokio::net::TcpStream) -> 
         let wait = if first { header_timeout } else { idle_timeout };
         match tokio::time::timeout(wait, reader.fill_buf()).await {
             Err(_) => return Ok(()),
-            Ok(Ok(buf)) if buf.is_empty() => return Ok(()),
+            // the peer closed without starting a request
+            Ok(Ok([])) => return Ok(()),
             Ok(Ok(_)) => {}
             Ok(Err(err)) => return Err(err),
         }
