@@ -1,7 +1,12 @@
 #![cfg(not(feature = "liquid"))] // drives a regtest bitcoind; the REST API is Bitcoin-only
 //! End-to-end cover for the Esplora-compatible REST API against a regtest node.
 
-use std::{collections::HashMap, future, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    future,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context as _;
 use bindex_electrum::{
@@ -15,7 +20,7 @@ use corepc_node::{exe_path, Conf, Node};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::{TcpListener, TcpStream},
 };
 
@@ -168,6 +173,11 @@ async fn rest_api_serves_a_regtest_chain() -> anyhow::Result<()> {
         "500",
         "--broadcast-via",
         "bitcoind",
+        // short enough for the slow-client check below
+        "--rest-header-timeout-secs",
+        "2",
+        "--rest-idle-timeout-secs",
+        "2",
         // enables the mempool poller; the listener below binds its own port
         "--http-addr",
         "127.0.0.1:0",
@@ -175,6 +185,7 @@ async fn rest_api_serves_a_regtest_chain() -> anyhow::Result<()> {
     config.validate()?;
 
     let electrum = TcpListener::bind("127.0.0.1:0").await?;
+    let electrum_addr = electrum.local_addr()?;
     let http = TcpListener::bind("127.0.0.1:0").await?;
     let addr = http.local_addr()?;
 
@@ -565,6 +576,81 @@ async fn rest_api_serves_a_regtest_chain() -> anyhow::Result<()> {
     let fees = get_ok(addr, "/fee-estimates").await?.json();
     assert!(fees.is_object(), "fee estimates: {fees}");
 
+    let package = request(
+        addr,
+        "POST",
+        "/txs/package?maxfeerate=0.10000000",
+        Some(&format!("[\"{}\"]", hex::encode(serialize(&pending_tx)))),
+    )
+    .await?;
+    // submitpackage may refuse a one-transaction package outright; either way
+    // the parameters were accepted and the call reached bitcoind
+    assert!(
+        package.status == 200 || package.body.starts_with("submitpackage RPC error:"),
+        "{} {}",
+        package.status,
+        package.body
+    );
+    let too_many = request(
+        addr,
+        "POST",
+        "/txs/package",
+        Some(&format!("[{}]", vec!["\"00\""; 26].join(","))),
+    )
+    .await?;
+    assert_eq!(too_many.status, 400);
+    assert_eq!(too_many.body, "Exceeded maximum of 25 transactions");
+
+    // ---------------------------------------------------------------- limits
+
+    // a client that never finishes its request head is dropped, not parked
+    let slow_started = Instant::now();
+    let mut half_sent = TcpStream::connect(addr).await?;
+    half_sent
+        .write_all(b"GET /blocks/tip/height HTTP/1.1\r\nHost: x\r\n")
+        .await?;
+    let mut drained = Vec::new();
+    half_sent.read_to_end(&mut drained).await?;
+    let drained = String::from_utf8_lossy(&drained);
+    assert!(drained.starts_with("HTTP/1.1 408"), "{drained}");
+    assert!(
+        slow_started.elapsed() < Duration::from_secs(10),
+        "the slow client was not timed out"
+    );
+    assert_eq!(get_ok(addr, "/blocks/tip/height").await?.body, "102");
+
+    // expensive queries must not lock out the cheap routes or Electrum
+    let miner_address = miner.to_string();
+    let hot: Vec<_> = (0..8)
+        .map(|_| {
+            let path = format!("/address/{miner_address}/txs/summary");
+            tokio::spawn(async move { get(addr, &path).await })
+        })
+        .collect();
+    for _ in 0..10 {
+        let cheap = tokio::time::timeout(Duration::from_secs(5), get_ok(addr, "/blocks/tip/height"))
+            .await;
+        assert!(cheap.is_ok(), "a cheap REST route queued behind the history replays");
+        cheap??;
+        let ping = tokio::time::timeout(
+            Duration::from_secs(5),
+            electrum_call(electrum_addr, "server.ping"),
+        )
+        .await;
+        assert!(ping.is_ok(), "electrum queued behind the REST history replays");
+        ping??;
+    }
+    for task in hot {
+        let response = task.await??;
+        // 503 is the semaphore shedding load, which is also a pass
+        assert!(
+            response.status == 200 || response.status == 503,
+            "{} {}",
+            response.status,
+            response.body
+        );
+    }
+
     // ---------------------------------------------------------------- fallthrough
 
     let missing = get(addr, "/does/not/exist").await?;
@@ -577,6 +663,21 @@ async fn rest_api_serves_a_regtest_chain() -> anyhow::Result<()> {
     rest_task.abort();
     electrum_task.abort();
     Ok(())
+}
+
+/// One Electrum JSON-RPC call, to check the protocol server stays answerable.
+async fn electrum_call(addr: SocketAddr, method: &str) -> anyhow::Result<Value> {
+    let stream = TcpStream::connect(addr).await?;
+    let (reader, mut writer) = stream.into_split();
+    writer
+        .write_all(
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#).as_bytes(),
+        )
+        .await?;
+    writer.write_all(b"\n").await?;
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines.next_line().await?.context("electrum closed")?;
+    Ok(serde_json::from_str(&line)?)
 }
 
 /// A regtest P2WPKH address outside the node's wallet.
@@ -597,4 +698,187 @@ async fn wait_for_mempool(addr: SocketAddr, expected: usize) -> anyhow::Result<(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     anyhow::bail!("mempool never reached {expected} transactions")
+}
+
+/// The two policies that are easiest to get wrong and hardest to see: nothing
+/// reaches the local node in tor mode, and the UTXO cap is on the largest the
+/// live set ever was, not on what is there now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tor_mode_refuses_local_submission_and_the_utxo_cap_is_historical(
+) -> anyhow::Result<()> {
+    let bitcoind = match exe_path() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("skipping tor-mode E2E test: BITCOIND_EXE is not set or invalid: {err}");
+            return Ok(());
+        }
+    };
+
+    let mut conf = Conf::default();
+    conf.args.push("-rest");
+    let node = Node::with_conf(bitcoind, &conf)?;
+    let miner = node.client.new_address()?;
+    node.client.generate_to_address(101, &miner)?;
+
+    // an address that holds two outputs at once, then none
+    let hot = node.client.new_address()?;
+    let mut funded = Vec::new();
+    for sats in [60_000u64, 70_000] {
+        let txid = node
+            .client
+            .send_to_address(&hot, Amount::from_sat(sats))?
+            .txid()
+            .context("no txid")?;
+        let tx = node.client.get_raw_transaction(txid)?.transaction()?;
+        let vout = tx
+            .output
+            .iter()
+            .position(|output| output.script_pubkey == hot.script_pubkey())
+            .context("hot output not found")? as u32;
+        node.client.generate_to_address(1, &miner)?;
+        // hot belongs to the wallet, so without this the next payment can pick
+        // the output up as an input and the sweep below finds it gone
+        let _: Value = node.client.call(
+            "lockunspent",
+            &[
+                serde_json::json!(false),
+                serde_json::json!([{"txid": txid.to_string(), "vout": vout}]),
+            ],
+        )?;
+        funded.push((txid, vout, sats));
+    }
+
+    // sweep both of them, so the live set is back to zero but peaked at two
+    let inputs: Vec<Value> = funded
+        .iter()
+        .map(|(txid, vout, _)| serde_json::json!({"txid": txid.to_string(), "vout": vout}))
+        .collect();
+    let swept: u64 = funded.iter().map(|(_, _, sats)| sats).sum::<u64>() - 5_000;
+    let outputs = serde_json::json!([{ miner.to_string(): Amount::from_sat(swept).to_btc() }]);
+    let unsigned: String = node
+        .client
+        .call("createrawtransaction", &[serde_json::json!(inputs), outputs])?;
+    let signed: Value = node
+        .client
+        .call("signrawtransactionwithwallet", &[serde_json::json!(unsigned)])?;
+    let sweep_hex = signed["hex"].as_str().context("signed hex")?.to_string();
+    let _: Value = node
+        .client
+        .call("sendrawtransaction", &[serde_json::json!(sweep_hex)])?;
+    node.client.generate_to_address(1, &miner)?;
+
+    // one more signed transaction, never broadcast, to offer the REST API
+    let spendable = node.client.new_address()?;
+    let unbroadcast_txid = node
+        .client
+        .send_to_address(&spendable, Amount::from_sat(40_000))?
+        .txid()
+        .context("no txid")?;
+    let unbroadcast = node.client.get_raw_transaction(unbroadcast_txid)?.transaction()?;
+    node.client.generate_to_address(1, &miner)?;
+    let child_input = serde_json::json!([{
+        "txid": unbroadcast_txid.to_string(),
+        "vout": unbroadcast
+            .output
+            .iter()
+            .position(|o| o.script_pubkey == spendable.script_pubkey())
+            .context("no output")?,
+    }]);
+    let child_outputs = serde_json::json!([{ miner.to_string(): Amount::from_sat(35_000).to_btc() }]);
+    let child_unsigned: String = node
+        .client
+        .call("createrawtransaction", &[child_input, child_outputs])?;
+    let child_signed: Value = node
+        .client
+        .call("signrawtransactionwithwallet", &[serde_json::json!(child_unsigned)])?;
+    let child_hex = child_signed["hex"].as_str().context("child hex")?.to_string();
+
+    let db_dir = TempDir::with_prefix("bindex-tor-db")?;
+    let rest_url = format!("http://{}", node.params.rpc_socket);
+    let mut chain =
+        bindex::IndexedChain::open_with_rest_url(db_dir.path(), Network::Regtest, rest_url.clone())?;
+    chain.sync(1000)?;
+    drop(chain);
+
+    let state_dir = TempDir::with_prefix("bindex-tor-state")?;
+    let config = Config::try_parse_from([
+        "bindex-electrum",
+        "--network",
+        "regtest",
+        "--bindex-db-path",
+        db_dir.path().to_str().context("db path")?,
+        "--bitcoind-rest-url",
+        &rest_url,
+        "--bitcoind-rpc-url",
+        &rest_url,
+        "--bitcoind-rpc-cookie",
+        node.params.cookie_file.to_str().context("cookie path")?,
+        "--tcp-listen",
+        "127.0.0.1:0",
+        "--cache-path",
+        state_dir.path().join("cache.sqlite3").to_str().context("cache")?,
+        "--monitor-path",
+        state_dir.path().join("monitor.json").to_str().context("monitor")?,
+        "--broadcast-via",
+        "tor",
+        // deliberately nowhere: a push must fail rather than fall back
+        "--tor-proxy",
+        "127.0.0.1:1",
+        "--tor-broadcast-url",
+        "http://nowhere.onion/api/tx",
+        "--tor-package-url",
+        "http://nowhere.onion/api/v1/txs/package",
+        "--utxos-limit",
+        "1",
+        "--http-addr",
+        "127.0.0.1:0",
+    ])?;
+    config.validate()?;
+
+    let http = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = http.local_addr()?;
+    let server = Server::new(config)?;
+    let rest_task = tokio::spawn(rest::run_listener(RestApi::new(server), http));
+
+    // the address holds nothing now, but once held two, so the cap applies
+    let stats = get_ok(addr, &format!("/address/{hot}")).await?.json();
+    assert_eq!(stats["chain_stats"]["funded_txo_count"], 2);
+    assert_eq!(stats["chain_stats"]["spent_txo_count"], 2);
+    assert_eq!(stats["chain_stats"]["tx_count"], 3);
+    let capped = get(addr, &format!("/address/{hot}/utxo")).await?;
+    assert_eq!(capped.status, 400, "{}", capped.body);
+    assert!(capped.body.starts_with("Too many UTXOs"), "{}", capped.body);
+    // an address that never held more than one is still served
+    let single = get(addr, &format!("/address/{spendable}/utxo")).await?;
+    assert_eq!(single.status, 200, "{}", single.body);
+
+    // nothing may reach the local node in tor mode
+    let test_accept = request(
+        addr,
+        "POST",
+        "/txs/test",
+        Some(&format!("[\"{child_hex}\"]")),
+    )
+    .await?;
+    assert_eq!(test_accept.status, 400);
+    assert_eq!(
+        test_accept.body,
+        "testmempoolaccept is unavailable with --broadcast-via tor"
+    );
+
+    let pushed = request(addr, "POST", "/tx", Some(&child_hex)).await?;
+    assert_eq!(pushed.status, 400, "{}", pushed.body);
+    let package = request(addr, "POST", "/txs/package", Some(&format!("[\"{child_hex}\"]"))).await?;
+    assert_eq!(package.status, 400, "{}", package.body);
+
+    // ...and the node never saw either of them
+    let mempool: Value = node.client.call("getrawmempool", &[])?;
+    assert_eq!(
+        mempool.as_array().context("mempool array")?.len(),
+        0,
+        "a transaction reached bitcoind in tor mode: {mempool}"
+    );
+
+    rest_task.abort();
+    Ok(())
 }
