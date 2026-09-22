@@ -1,15 +1,26 @@
 //! Route table and handlers.
 
+use bitcoin::{OutPoint, Transaction, Txid};
 use serde_json::Value;
 
-use crate::rest::{
-    http::{HttpRequest, HttpResponse},
-    json,
-    query::{self},
-    text,
-    types::{BlockStatus, BlockValue},
-    ttl_by_depth, HttpError, RestApi, Result, TTL_LONG, TTL_SHORT,
+use crate::{
+    merkle,
+    protocol::ElectrumScripthash,
+    rest::{
+        http::{HttpRequest, HttpResponse},
+        json,
+        query::{self, FoundTx},
+        text,
+        types::{
+            merkleblock_hex, BlockStatus, BlockValue, MerkleProof, SpendingValue,
+            TransactionStatus,
+        },
+        ttl_by_depth, HttpError, RestApi, Result, TTL_LONG, TTL_SHORT,
+    },
 };
+
+/// `GET /txs/outspends?txids=` accepts at most this many.
+const MAX_BATCH_TXIDS: usize = 50;
 
 /// Dispatch one request.
 ///
@@ -41,6 +52,24 @@ fn route_blocking(
         ("GET", ["block", hash, "txs"]) => block_txs(api, hash, None),
         ("GET", ["block", hash, "txs", start]) => block_txs(api, hash, Some(start)),
         ("GET", ["internal", "block", hash, "txs"]) => internal_block_txs(api, hash),
+
+        ("GET", ["tx", txid]) => tx(api, txid),
+        ("GET", ["tx", txid, "hex"]) => tx_hex(api, txid),
+        ("GET", ["tx", txid, "raw"]) => tx_raw(api, txid),
+        ("GET", ["tx", txid, "status"]) => tx_status(api, txid),
+        ("GET", ["tx", txid, "merkle-proof"]) => tx_merkle_proof(api, txid),
+        ("GET", ["tx", txid, "merkleblock-proof"]) => tx_merkleblock_proof(api, txid),
+        ("GET", ["tx", txid, "outspend", vout]) => tx_outspend(api, txid, vout),
+        ("GET", ["tx", txid, "outspends"]) => tx_outspends(api, txid),
+        ("GET", ["txs", "outspends"]) => txs_outspends(api, request),
+        ("POST", ["internal", "txs"]) => internal_txs(api, request),
+        ("POST", ["internal", "txs", "outspends", "by-txid"]) => {
+            internal_outspends_by_txid(api, request)
+        }
+        ("POST", ["internal", "txs", "outspends", "by-outpoint"]) => {
+            internal_outspends_by_outpoint(api, request)
+        }
+
         _ => Err(unrouted(request)),
     }
 }
@@ -245,4 +274,273 @@ fn block_context(
         in_best_chain,
         height,
     ))
+}
+
+// ---------------------------------------------------------------- transactions
+
+fn tx(api: &RestApi, txid: &str) -> Result<HttpResponse> {
+    let txid = query::parse_txid(txid)?;
+    let found = found_tx(api, &txid)?;
+    let value = query::tx_value(api, &found)?;
+    let tip = query::tip_height(api)?;
+    json(&value, ttl_by_depth(value.status.height(), tip))
+}
+
+fn tx_hex(api: &RestApi, txid: &str) -> Result<HttpResponse> {
+    let txid = query::parse_txid(txid)?;
+    let found = found_tx(api, &txid)?;
+    let tip = query::tip_height(api)?;
+    Ok(text(
+        hex::encode(&found.raw),
+        ttl_by_depth(found.status.height(), tip),
+    ))
+}
+
+fn tx_raw(api: &RestApi, txid: &str) -> Result<HttpResponse> {
+    let txid = query::parse_txid(txid)?;
+    let found = found_tx(api, &txid)?;
+    let tip = query::tip_height(api)?;
+    Ok(HttpResponse::binary(
+        found.raw,
+        Some(ttl_by_depth(found.status.height(), tip)),
+    ))
+}
+
+fn tx_status(api: &RestApi, txid: &str) -> Result<HttpResponse> {
+    let txid = query::parse_txid(txid)?;
+    let found = found_tx(api, &txid)?;
+    let tip = query::tip_height(api)?;
+    json(&found.status, ttl_by_depth(found.status.height(), tip))
+}
+
+fn tx_merkle_proof(api: &RestApi, txid: &str) -> Result<HttpResponse> {
+    let txid = query::parse_txid(txid)?;
+    let (height, txids, pos) = confirmed_block_position(api, &txid)?;
+    let leaves: Vec<_> = txids.iter().map(|txid| *txid.as_raw_hash()).collect();
+    let proof = merkle::branch_and_root(&leaves, pos);
+    let tip = query::tip_height(api)?;
+    json(
+        &MerkleProof {
+            block_height: height,
+            merkle: proof.branch.iter().map(ToString::to_string).collect(),
+            pos,
+        },
+        ttl_by_depth(Some(height), tip),
+    )
+}
+
+fn tx_merkleblock_proof(api: &RestApi, txid: &str) -> Result<HttpResponse> {
+    let txid = query::parse_txid(txid)?;
+    let (height, txids, _) = confirmed_block_position(api, &txid)?;
+    let header = api
+        .server
+        .chain()
+        .header_at_height(height)?
+        .ok_or_else(|| HttpError::not_found("Block not found"))?;
+    let proof =
+        merkleblock_hex(&header, &txids, txid).map_err(HttpError::server_error)?;
+    let tip = query::tip_height(api)?;
+    Ok(text(proof, ttl_by_depth(Some(height), tip)))
+}
+
+fn tx_outspend(api: &RestApi, txid: &str, vout: &str) -> Result<HttpResponse> {
+    let txid = query::parse_txid(txid)?;
+    let vout = query::parse_u32(vout)?;
+    let spending = outspend(api, &txid, vout)?;
+    let tip = query::tip_height(api)?;
+    let ttl = ttl_by_depth(
+        spending.status.as_ref().and_then(TransactionStatus::height),
+        tip,
+    );
+    json(&spending, ttl)
+}
+
+fn tx_outspends(api: &RestApi, txid: &str) -> Result<HttpResponse> {
+    let txid = query::parse_txid(txid)?;
+    let found = found_tx(api, &txid)?;
+    json(&outspends_of(api, &txid, &found.tx)?, TTL_SHORT)
+}
+
+fn txs_outspends(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let Some(param) = request.param("txids") else {
+        return Err(HttpError::bad_request("No txids specified"));
+    };
+    let txids: Vec<&str> = param.split(',').filter(|s| !s.is_empty()).collect();
+    if txids.len() > MAX_BATCH_TXIDS {
+        return Err(HttpError::bad_request("Too many txids requested"));
+    }
+    let mut out = Vec::with_capacity(txids.len());
+    for txid in txids {
+        out.push(outspends_or_empty(api, txid)?);
+    }
+    json(&out, TTL_SHORT)
+}
+
+fn internal_txs(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let txids = txid_body(request)?;
+    let mut out = Vec::new();
+    for txid in txids {
+        if let Some(value) = query::tx_value_opt(api, &txid)? {
+            out.push(value);
+        }
+    }
+    json(&out, 0)
+}
+
+fn internal_outspends_by_txid(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let txids = txid_body(request)?;
+    let mut out = Vec::with_capacity(txids.len());
+    for txid in txids {
+        out.push(match query::find_tx(api, &txid)? {
+            Some(found) => outspends_of(api, &txid, &found.tx)?,
+            None => Vec::new(),
+        });
+    }
+    json(&out, TTL_SHORT)
+}
+
+fn internal_outspends_by_outpoint(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let outpoints: Vec<String> = serde_json::from_slice(&request.body)
+        .map_err(|err| HttpError::bad_request(err.to_string()).cached(0))?;
+    let mut out = Vec::with_capacity(outpoints.len());
+    for entry in outpoints {
+        out.push(match parse_outpoint(&entry) {
+            Some(outpoint) => outspend(api, &outpoint.txid, outpoint.vout)?,
+            None => SpendingValue::unspent(),
+        });
+    }
+    json(&out, TTL_SHORT)
+}
+
+// ---------------------------------------------------------------- tx helpers
+
+fn found_tx(api: &RestApi, txid: &Txid) -> Result<FoundTx> {
+    query::find_tx(api, txid)?.ok_or_else(|| HttpError::not_found("Transaction not found"))
+}
+
+fn txid_body(request: &HttpRequest) -> Result<Vec<Txid>> {
+    let raw: Vec<String> = serde_json::from_slice(&request.body)
+        .map_err(|err| HttpError::bad_request(err.to_string()).cached(0))?;
+    raw.iter()
+        .map(|value| {
+            query::parse_txid(value).map_err(|err| HttpError::bad_request(err.message).cached(0))
+        })
+        .collect()
+}
+
+fn parse_outpoint(value: &str) -> Option<OutPoint> {
+    let (txid, vout) = value.split_once(':')?;
+    Some(OutPoint {
+        txid: txid.parse().ok()?,
+        vout: vout.parse().ok()?,
+    })
+}
+
+/// The block a confirmed transaction sits in, its txids, and its position.
+fn confirmed_block_position(
+    api: &RestApi,
+    txid: &Txid,
+) -> Result<(usize, Vec<Txid>, usize)> {
+    let found = query::find_tx(api, txid)?
+        .filter(|found| found.status.confirmed)
+        .ok_or_else(|| HttpError::not_found("Transaction not found or is unconfirmed"))?;
+    let height = found
+        .status
+        .height()
+        .ok_or_else(|| HttpError::server_error("confirmed transaction without a height"))?;
+    let hash = api
+        .server
+        .chain()
+        .hash_at_height(height)?
+        .ok_or_else(|| HttpError::not_found("Block not found"))?;
+    let txids = query::block_txids(&query::block_json(api, &hash)?)?;
+    let pos = match found.position {
+        Some(position) if txids.get(position as usize) == Some(txid) => position as usize,
+        _ => txids
+            .iter()
+            .position(|candidate| candidate == txid)
+            .ok_or_else(|| HttpError::server_error("transaction missing from its block"))?,
+    };
+    Ok((height, txids, pos))
+}
+
+/// Who spent one output, if anyone.
+///
+/// bindex has no spending index (the `spending` column family is unused), so
+/// the spender is found through the funding script: a transaction spending an
+/// output is indexed under that output's scripthash, from the funding block
+/// onwards. The cost is therefore proportional to how often the script has been
+/// reused, which is why this is the one route that can be slow on a hot address.
+fn outspend(api: &RestApi, txid: &Txid, vout: u32) -> Result<SpendingValue> {
+    let Some(found) = query::find_tx(api, txid)? else {
+        return Ok(SpendingValue::unspent());
+    };
+    let Some(output) = found.tx.output.get(vout as usize) else {
+        return Ok(SpendingValue::unspent());
+    };
+    let script = output.script_pubkey.as_script();
+    if script.is_empty() || script.is_op_return() {
+        // never indexed, and unspendable anyway
+        return Ok(SpendingValue::unspent());
+    }
+    let outpoint = OutPoint { txid: *txid, vout };
+
+    let mempool_spender = {
+        let mempool = api.server.mempool().read().expect("mempool lock");
+        mempool.spender(&outpoint).and_then(|spender| {
+            mempool
+                .raw_transaction(&spender)
+                .map(<[u8]>::to_vec)
+                .map(|raw| (spender, raw))
+        })
+    };
+    if let Some((spender, raw)) = mempool_spender {
+        let tx: Transaction = bitcoin::consensus::deserialize(&raw)
+            .map_err(|err| HttpError::server_error(format!("decode {spender}: {err}")))?;
+        let vin = tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == outpoint)
+            .unwrap_or(0) as u32;
+        return Ok(SpendingValue::spent(
+            spender,
+            vin,
+            TransactionStatus::unconfirmed(),
+        ));
+    }
+
+    let Some(funding_height) = found.status.height() else {
+        // an unconfirmed output cannot have a confirmed spender
+        return Ok(SpendingValue::unspent());
+    };
+    let scripthash = ElectrumScripthash::from_script(script);
+    let Some(spender) = api
+        .server
+        .chain()
+        .find_spender(outpoint, scripthash, funding_height)?
+    else {
+        return Ok(SpendingValue::unspent());
+    };
+    let time = query::block_time(api, spender.height)?;
+    Ok(SpendingValue::spent(
+        spender.txid,
+        spender.vin,
+        TransactionStatus::confirmed(spender.height, &spender.block_hash, time),
+    ))
+}
+
+fn outspends_of(api: &RestApi, txid: &Txid, tx: &Transaction) -> Result<Vec<SpendingValue>> {
+    (0..tx.output.len() as u32)
+        .map(|vout| outspend(api, txid, vout))
+        .collect()
+}
+
+fn outspends_or_empty(api: &RestApi, txid: &str) -> Result<Vec<SpendingValue>> {
+    let Ok(txid) = query::parse_txid(txid) else {
+        return Ok(Vec::new());
+    };
+    match query::find_tx(api, &txid)? {
+        Some(found) => outspends_of(api, &txid, &found.tx),
+        None => Ok(Vec::new()),
+    }
 }
