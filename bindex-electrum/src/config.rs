@@ -29,6 +29,12 @@ pub struct Config {
     #[arg(long)]
     pub bindex_db_path: PathBuf,
 
+    /// RocksDB secondary directory (default: `<bindex-db-path>/<db-name>-electrum-secondary`).
+    /// Each process needs its own, so a second instance against the same index
+    /// must override it.
+    #[arg(long)]
+    pub secondary_path: Option<PathBuf>,
+
     #[arg(long, default_value = "http://127.0.0.1:8332")]
     pub bitcoind_rest_url: String,
 
@@ -119,6 +125,89 @@ pub struct Config {
 
     #[arg(long)]
     pub donation_address: Option<String>,
+
+    #[command(flatten)]
+    pub rest: RestConfig,
+}
+
+/// Esplora-compatible REST API (off unless `--http-addr` is given).
+///
+/// The defaults mirror the mempool/electrs REST server this API is modelled on.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct RestConfig {
+    /// Serve the Esplora-compatible REST API on this address.
+    #[arg(long)]
+    pub http_addr: Option<SocketAddr>,
+
+    /// Send `Access-Control-Allow-Origin: *` (no other CORS headers, no preflight).
+    #[arg(long)]
+    pub cors: bool,
+
+    /// Enable `GET /address-prefix/:prefix` (unsupported by this backend).
+    #[arg(long)]
+    pub address_search: bool,
+
+    /// Blocks returned by `GET /blocks[/:start_height]`.
+    #[arg(long, default_value_t = 10)]
+    pub rest_default_block_limit: usize,
+
+    /// Confirmed transactions per page of `GET /address/:addr/txs/chain`.
+    #[arg(long, default_value_t = 25)]
+    pub rest_default_chain_txs_per_page: usize,
+
+    /// Default (and cap) for `?max_txs` on the combined/mempool address routes.
+    #[arg(long, default_value_t = 50)]
+    pub rest_default_max_mempool_txs: usize,
+
+    /// Default and hard cap for `GET /address/:addr/txs/summary`.
+    #[arg(long, default_value_t = 5000)]
+    pub rest_default_max_address_summary_txs: usize,
+
+    /// Default and cap for `GET /internal/mempool/txs`.
+    #[arg(long, default_value_t = 1000)]
+    pub rest_max_mempool_page_size: usize,
+
+    /// Default and cap for `GET /mempool/txids/page`.
+    #[arg(long, default_value_t = 10000)]
+    pub rest_max_mempool_txid_page_size: usize,
+
+    /// Peak historical live-set cap for `GET /address/:addr/utxo`.
+    #[arg(long, default_value_t = 500)]
+    pub utxos_limit: usize,
+
+    /// Entries kept for `GET /mempool/recent`.
+    #[arg(long, default_value_t = 10)]
+    pub mempool_recent_txs_size: usize,
+
+    /// Hardcoded in the reference; kept configurable for tests.
+    #[arg(long, default_value_t = 100)]
+    pub rest_max_history_txs: usize,
+}
+
+impl Default for RestConfig {
+    fn default() -> Self {
+        Self {
+            http_addr: None,
+            cors: false,
+            address_search: false,
+            rest_default_block_limit: 10,
+            rest_default_chain_txs_per_page: 25,
+            rest_default_max_mempool_txs: 50,
+            rest_default_max_address_summary_txs: 5000,
+            rest_max_mempool_page_size: 1000,
+            rest_max_mempool_txid_page_size: 10000,
+            utxos_limit: 500,
+            mempool_recent_txs_size: 10,
+            rest_max_history_txs: 100,
+        }
+    }
+}
+
+impl RestConfig {
+    /// `capped_max_txs`: the `?max_txs` query parameter, defaulted then capped.
+    pub fn capped_max_txs(&self, requested: Option<usize>, default: usize, cap: usize) -> usize {
+        requested.unwrap_or(default).min(cap)
+    }
 }
 
 fn default_broadcast_via() -> BroadcastVia {
@@ -161,6 +250,9 @@ impl Config {
         }
         if self.secondary_refresh_ms == 0 {
             anyhow::bail!("secondary-refresh-ms must be positive");
+        }
+        if self.rest.http_addr.is_some() && cfg!(feature = "liquid") {
+            anyhow::bail!("--http-addr is not supported by the liquid build");
         }
         if self.broadcast_via == BroadcastVia::Tor {
             self.tor_broadcast_target()?;
@@ -237,6 +329,13 @@ impl Config {
             .clone()
             .unwrap_or_else(|| self.bindex_db_path.join("electrum-monitor.json"))
     }
+
+    pub fn secondary_path(&self) -> PathBuf {
+        self.secondary_path.clone().unwrap_or_else(|| {
+            self.bindex_db_path
+                .join(format!("{}-electrum-secondary", self.db_name()))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +346,11 @@ mod tests {
         let mut argv = vec!["bindex-electrum", "--bindex-db-path", "/nonexistent"];
         argv.extend_from_slice(args);
         Config::try_parse_from(argv).expect("args parse")
+    }
+
+    #[test]
+    fn rest_defaults_match_the_clap_defaults() {
+        assert_eq!(config(&[]).rest, RestConfig::default());
     }
 
     #[test]

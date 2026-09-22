@@ -54,7 +54,26 @@ struct TorPush {
     package: PushTarget,
 }
 
+/// Shared state accessors for the REST API (unused in the liquid build, which
+/// compiles the REST module out).
+#[cfg_attr(feature = "liquid", allow(dead_code))]
 impl Server {
+    pub(crate) fn config(&self) -> &Config {
+        &self.state.config
+    }
+
+    pub(crate) fn chain(&self) -> &ChainAdapter {
+        &self.state.chain
+    }
+
+    pub(crate) fn mempool(&self) -> &RwLock<MempoolIndex> {
+        &self.state.mempool
+    }
+
+    pub(crate) fn bitcoind(&self) -> &RpcClient {
+        &self.state.bitcoind
+    }
+
     pub fn new(config: Config) -> anyhow::Result<Self> {
         let chain = ChainAdapter::open(&config).context("open bindex chain")?;
         let monitor = Monitor::new(config.monitor_path()).context("open electrum monitor")?;
@@ -97,6 +116,17 @@ impl Server {
 
     pub async fn run(self) -> anyhow::Result<()> {
         self.spawn_secondary_refresh_task();
+        self.spawn_mempool_poll_task();
+
+        #[cfg(not(feature = "liquid"))]
+        if let Some(addr) = self.state.config.rest.http_addr {
+            let server = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = crate::rest::serve(server, addr).await {
+                    log::error!("REST listener stopped: {err:?}");
+                }
+            });
+        }
 
         let tcp = TcpListener::bind(self.state.config.tcp_listen)
             .await
@@ -135,6 +165,49 @@ impl Server {
                     }
                     Ok(Err(err)) => log::warn!("electrum secondary refresh failed: {err}"),
                     Err(err) => log::warn!("electrum secondary refresh task failed: {err}"),
+                }
+            }
+        });
+    }
+
+    /// Keep the mempool index in step with the node.
+    ///
+    /// Only started when the REST API is enabled: the Electrum methods work
+    /// without it (they answer from the chain index), while every REST route
+    /// that mentions unconfirmed transactions needs it.
+    pub(crate) fn spawn_mempool_poll_task(&self) {
+        if self.state.config.rest.http_addr.is_none() {
+            return;
+        }
+        let core = crate::corerest::CoreRest::new(self.state.config.bitcoind_rest_url.clone());
+        let interval = self.state.config.mempool_poll_interval();
+        let recent_cap = self.state.config.rest.mempool_recent_txs_size;
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = time::interval(interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let core = core.clone();
+                let worker = server.clone();
+                let polled = tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
+                    crate::mempool::poll_once(&core, worker.mempool(), recent_cap, 8)
+                        .map(|(added, removed)| (added, removed, started.elapsed()))
+                })
+                .await;
+                match polled {
+                    Ok(Ok((added, removed, elapsed))) => {
+                        if added > 0 || removed > 0 {
+                            log::debug!(
+                                "mempool: +{added} -{removed} in {:.1?} ({} txs)",
+                                elapsed,
+                                server.state.mempool.read().map(|m| m.len()).unwrap_or(0)
+                            );
+                        }
+                    }
+                    Ok(Err(err)) => log::warn!("mempool poll failed: {err}"),
+                    Err(err) => log::warn!("mempool poll task failed: {err}"),
                 }
             }
         });
@@ -428,7 +501,7 @@ impl Server {
         }
     }
 
-    async fn broadcast(&self, raw_tx_hex: &str) -> Result<Value, ProtocolError> {
+    pub(crate) async fn broadcast(&self, raw_tx_hex: &str) -> Result<Value, ProtocolError> {
         let Some(TorPush { tx: target, .. }) = &self.state.tor_push else {
             return self
                 .state
@@ -456,7 +529,7 @@ impl Server {
     /// to the onion package endpoint on their own circuit and never touch the
     /// local bitcoind's `submitpackage`. The endpoint's JSON (bitcoind's
     /// submitpackage result) is returned as-is, exactly like the RPC path.
-    async fn broadcast_package(&self, raw_txs: &[String]) -> Result<Value, ProtocolError> {
+    pub(crate) async fn broadcast_package(&self, raw_txs: &[String]) -> Result<Value, ProtocolError> {
         match &self.state.tor_push {
             Some(TorPush { package, .. }) => {
                 torpush::push_package(self.state.config.tor_proxy, package, raw_txs)

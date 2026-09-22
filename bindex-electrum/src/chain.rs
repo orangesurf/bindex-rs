@@ -78,6 +78,65 @@ pub struct ConfirmedScripthash {
     pub utxos: Vec<ConfirmedUtxo>,
 }
 
+/// One transaction in a script's confirmed history, with what it moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptHistoryRow {
+    pub txid: Txid,
+    pub height: usize,
+    pub position: u32,
+    pub funded: u64,
+    pub funded_count: usize,
+    pub spent: u64,
+    pub spent_count: usize,
+}
+
+impl ScriptHistoryRow {
+    /// Net effect on the script's balance (the `value` of a history summary).
+    pub fn net_value(&self) -> i64 {
+        self.funded as i64 - self.spent as i64
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptUtxo {
+    pub outpoint: OutPoint,
+    pub value: u64,
+    pub height: usize,
+    pub position: u32,
+}
+
+/// The full confirmed history of one script, folded in chain order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptHistory {
+    /// Ascending by `(height, position)`.
+    pub rows: Vec<ScriptHistoryRow>,
+    /// Confirmed and still unspent, ascending by outpoint.
+    pub utxos: Vec<ScriptUtxo>,
+    pub funded_txo_count: usize,
+    pub funded_txo_sum: u64,
+    pub spent_txo_count: usize,
+    pub spent_txo_sum: u64,
+    /// Largest the live UTXO set ever got, which is what the REST utxo cap
+    /// applies to.
+    pub peak_live_utxos: usize,
+}
+
+impl ScriptHistory {
+    pub fn tx_count(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// Where a confirmed transaction spending a given outpoint sits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spender {
+    pub txid: Txid,
+    pub vin: u32,
+    pub height: usize,
+    pub position: u32,
+    pub block_hash: bitcoin::BlockHash,
+}
+
 #[derive(Clone)]
 pub struct ChainAdapter {
     chain: Arc<RwLock<bindex::IndexedChain>>,
@@ -87,9 +146,7 @@ pub struct ChainAdapter {
 
 impl ChainAdapter {
     pub fn open(config: &Config) -> Result<Self, Error> {
-        let secondary_path = config
-            .bindex_db_path
-            .join(format!("{}-electrum-secondary", config.db_name()));
+        let secondary_path = config.secondary_path();
         let chain = bindex::IndexedChain::open_secondary_named(
             &config.bindex_db_path,
             &config.db_name(),
@@ -331,6 +388,168 @@ impl ChainAdapter {
         chain
             .block_txids_at_height(height)?
             .ok_or(Error::Height(height))
+    }
+
+    pub fn tip_height(&self) -> Result<Option<usize>, Error> {
+        Ok(self
+            .chain
+            .read()
+            .map_err(|_| Error::Lock)?
+            .headers()
+            .tip_height())
+    }
+
+    pub fn hash_at_height(&self, height: usize) -> Result<Option<bitcoin::BlockHash>, Error> {
+        Ok(self
+            .chain
+            .read()
+            .map_err(|_| Error::Lock)?
+            .block_hash_at_height(height))
+    }
+
+    /// Decoded header of an active-chain block (Bitcoin format only).
+    #[cfg(not(feature = "liquid"))]
+    pub fn header_at_height(&self, height: usize) -> Result<Option<bitcoin::block::Header>, Error> {
+        self.chain
+            .read()
+            .map_err(|_| Error::Lock)?
+            .block_header_at_height(height)
+            .map_err(Error::Bindex)
+    }
+
+    /// Fold a script's whole confirmed history: which transactions touched it,
+    /// how much each moved, what is still unspent, and how large the live set
+    /// ever got.
+    ///
+    /// The index yields every transaction that funds *or* spends the script (it
+    /// indexes the spent outputs of each block too), in chain order, so a spend
+    /// is always seen after the output it spends. That makes one pass enough:
+    /// outputs paying the script are remembered as they appear, and an input is
+    /// ours exactly when it spends one of them — no prevout lookups, unlike the
+    /// per-input probing `confirmed_scripthash` does.
+    pub fn script_history(
+        &self,
+        scripthash: ElectrumScripthash,
+    ) -> Result<ScriptHistory, Error> {
+        let chain = self.chain.read().map_err(|_| Error::Lock)?;
+        let bindex_hash = scripthash
+            .to_bindex()
+            .map_err(|_| Error::InvalidScripthash)?;
+        let mut locations = chain
+            .locations_by_scripthash(&bindex_hash, None)?
+            .collect::<Vec<_>>();
+        locations.sort();
+        locations.dedup();
+
+        let mut history = ScriptHistory::default();
+        // every output ever paid to this script, for valuing the spends
+        let mut funded = BTreeMap::<OutPoint, u64>::new();
+        let mut live = BTreeMap::<OutPoint, ScriptUtxo>::new();
+
+        for location in locations {
+            let raw = chain.get_tx_bytes(&location)?;
+            let tx = fmt::parse_tx(&raw)?;
+            let txid = tx.txid;
+            let mut row = ScriptHistoryRow {
+                txid,
+                height: location.block_height(),
+                position: location.block_position(),
+                funded: 0,
+                funded_count: 0,
+                spent: 0,
+                spent_count: 0,
+            };
+
+            for prevout in &tx.inputs {
+                if let Some(value) = funded.get(prevout) {
+                    row.spent += value;
+                    row.spent_count += 1;
+                    live.remove(prevout);
+                }
+            }
+            for (vout, output) in tx.outputs.iter().enumerate() {
+                if ElectrumScripthash::from_script(bitcoin::Script::from_bytes(
+                    &output.script_pubkey,
+                )) != scripthash
+                {
+                    continue;
+                }
+                let outpoint = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                row.funded += output.value;
+                row.funded_count += 1;
+                funded.insert(outpoint, output.value);
+                live.insert(
+                    outpoint,
+                    ScriptUtxo {
+                        outpoint,
+                        value: output.value,
+                        height: location.block_height(),
+                        position: location.block_position(),
+                    },
+                );
+            }
+
+            history.peak_live_utxos = history.peak_live_utxos.max(live.len());
+            // an index prefix collision touches neither side
+            if row.funded_count > 0 || row.spent_count > 0 {
+                history.funded_txo_count += row.funded_count;
+                history.funded_txo_sum += row.funded;
+                history.spent_txo_count += row.spent_count;
+                history.spent_txo_sum += row.spent;
+                history.rows.push(row);
+            }
+        }
+
+        history.rows.sort_by_key(|row| (row.height, row.position));
+        history.utxos = live.into_values().collect();
+        Ok(history)
+    }
+
+    /// The confirmed transaction spending `outpoint`, if there is one.
+    ///
+    /// Scans the funding script's index rows from the funding block onwards:
+    /// the spender is indexed under the same scripthash (blocks index their
+    /// spent outputs), so nothing before the funding block can match.
+    pub fn find_spender(
+        &self,
+        outpoint: OutPoint,
+        scripthash: ElectrumScripthash,
+        funding_height: usize,
+    ) -> Result<Option<Spender>, Error> {
+        let chain = self.chain.read().map_err(|_| Error::Lock)?;
+        let bindex_hash = scripthash
+            .to_bindex()
+            .map_err(|_| Error::InvalidScripthash)?;
+        let previous = funding_height
+            .checked_sub(1)
+            .and_then(|height| chain.indexed_header_at_height(height));
+        let mut locations = chain
+            .locations_by_scripthash(&bindex_hash, previous)?
+            .collect::<Vec<_>>();
+        locations.sort();
+        locations.dedup();
+
+        for location in locations {
+            let raw = chain.get_tx_bytes(&location)?;
+            let tx = fmt::parse_tx(&raw)?;
+            if tx.txid == outpoint.txid {
+                continue;
+            }
+            let Some(vin) = tx.inputs.iter().position(|input| *input == outpoint) else {
+                continue;
+            };
+            return Ok(Some(Spender {
+                txid: tx.txid,
+                vin: vin as u32,
+                height: location.block_height(),
+                position: location.block_position(),
+                block_hash: location.block_hash(),
+            }));
+        }
+        Ok(None)
     }
 
     fn prevout_matches_scripthash(

@@ -1,9 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    sync::RwLock,
+};
 
 use bitcoin::{OutPoint, Txid};
 use serde::Serialize;
 
-use crate::protocol::{ElectrumScripthash, HistoryEntry};
+use crate::{
+    corerest::CoreRest,
+    protocol::{ElectrumScripthash, HistoryEntry},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MempoolEntry {
@@ -25,11 +31,29 @@ pub struct MempoolTx {
     pub outputs: BTreeMap<u32, (ElectrumScripthash, u64)>,
 }
 
+impl MempoolTx {
+    /// Total value of the transaction's outputs.
+    pub fn value(&self) -> u64 {
+        self.outputs.values().map(|(_, value)| value).sum()
+    }
+}
+
+/// One entry of the bounded "recently added" queue behind `/mempool/recent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecentTx {
+    pub txid: String,
+    pub fee: u64,
+    pub vsize: u64,
+    pub value: u64,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MempoolIndex {
     txs: HashMap<Txid, MempoolTx>,
     by_scripthash: HashMap<ElectrumScripthash, BTreeSet<Txid>>,
     spent_prevouts: HashMap<OutPoint, Txid>,
+    /// Newest first, capped by the poller.
+    recent: VecDeque<RecentTx>,
 }
 
 impl MempoolIndex {
@@ -107,6 +131,109 @@ impl MempoolIndex {
         self.txs.get(txid).map(|tx| tx.raw.as_slice())
     }
 
+    pub fn len(&self) -> usize {
+        self.txs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.txs.is_empty()
+    }
+
+    pub fn get(&self, txid: &Txid) -> Option<&MempoolTx> {
+        self.txs.get(txid)
+    }
+
+    pub fn contains(&self, txid: &Txid) -> bool {
+        self.txs.contains_key(txid)
+    }
+
+    /// All txids, in `Txid` order (what a `BTreeMap`-backed mempool pages in).
+    pub fn sorted_txids(&self) -> Vec<Txid> {
+        let mut txids: Vec<Txid> = self.txs.keys().copied().collect();
+        txids.sort_unstable();
+        txids
+    }
+
+    /// `(count, vsize, total_fee)`.
+    pub fn totals(&self) -> (usize, u64, u64) {
+        let mut vsize = 0;
+        let mut fee = 0;
+        for tx in self.txs.values() {
+            vsize += tx.vsize;
+            fee += tx.fee;
+        }
+        (self.txs.len(), vsize, fee)
+    }
+
+    /// The mempool transaction spending `outpoint`, if any.
+    pub fn spender(&self, outpoint: &OutPoint) -> Option<Txid> {
+        self.spent_prevouts.get(outpoint).copied()
+    }
+
+    /// Mempool transactions paying this scripthash (funding only; spends are
+    /// found through `spender`, since the index never resolves prevouts).
+    pub fn funding_txids(&self, scripthash: ElectrumScripthash) -> Vec<Txid> {
+        self.by_scripthash
+            .get(&scripthash)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Unconfirmed outputs paying this scripthash, as `(outpoint, value)`.
+    pub fn outputs_of(&self, scripthash: ElectrumScripthash) -> Vec<(OutPoint, u64)> {
+        let mut out = Vec::new();
+        for txid in self.funding_txids(scripthash) {
+            let Some(tx) = self.txs.get(&txid) else {
+                continue;
+            };
+            for (vout, (script, value)) in &tx.outputs {
+                if *script == scripthash {
+                    out.push((OutPoint { txid, vout: *vout }, *value));
+                }
+            }
+        }
+        out.sort_by_key(|(outpoint, _)| (outpoint.txid, outpoint.vout));
+        out
+    }
+
+    pub fn recent(&self) -> Vec<RecentTx> {
+        self.recent.iter().cloned().collect()
+    }
+
+    /// `/mempool`'s histogram: descending fee rate, one bin per ~50 kvB.
+    pub fn fee_histogram_bins(&self) -> Vec<(f32, u32)> {
+        let mut rates: Vec<(f32, u64)> = self
+            .txs
+            .values()
+            .filter(|tx| tx.vsize > 0)
+            .map(|tx| (tx.fee as f32 / tx.vsize as f32, tx.vsize))
+            .collect();
+        rates.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let mut histogram = Vec::new();
+        let mut bin_size: u64 = 0;
+        let mut last_rate = 0.0f32;
+        for (rate, vsize) in rates {
+            if bin_size > 50_000 && (last_rate - rate).abs() > f32::EPSILON {
+                histogram.push((last_rate, bin_size.min(u32::MAX as u64) as u32));
+                bin_size = 0;
+            }
+            last_rate = rate;
+            bin_size += vsize;
+        }
+        if bin_size > 0 {
+            histogram.push((last_rate, bin_size.min(u32::MAX as u64) as u32));
+        }
+        histogram
+    }
+
+    fn push_recent(&mut self, entry: RecentTx, cap: usize) {
+        self.recent.push_front(entry);
+        while self.recent.len() > cap {
+            self.recent.pop_back();
+        }
+    }
+
     pub fn fee_histogram(&self) -> Vec<(f64, u64)> {
         let mut buckets: BTreeMap<u64, u64> = BTreeMap::new();
         for tx in self.txs.values() {
@@ -122,6 +249,165 @@ impl MempoolIndex {
             .map(|(rate, vsize)| (rate as f64 / 1000.0, vsize))
             .collect()
     }
+}
+
+/// Entry metadata from `getrawmempool`-style verbose output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MempoolEntryInfo {
+    pub fee: u64,
+    pub vsize: u64,
+    pub ancestor_fees: u64,
+    pub ancestor_vsize: u64,
+    pub time: u64,
+}
+
+fn btc_to_sats(value: Option<&serde_json::Value>) -> u64 {
+    value
+        .and_then(serde_json::Value::as_f64)
+        .map(|btc| (btc * 1e8).round() as u64)
+        .unwrap_or(0)
+}
+
+/// Parse one `/rest/mempool/contents.json?verbose=true` entry.
+pub fn parse_entry(value: &serde_json::Value) -> MempoolEntryInfo {
+    let fees = value.get("fees");
+    MempoolEntryInfo {
+        fee: btc_to_sats(fees.and_then(|f| f.get("base")).or_else(|| value.get("fee"))),
+        vsize: value
+            .get("vsize")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        ancestor_fees: btc_to_sats(fees.and_then(|f| f.get("ancestor"))),
+        ancestor_vsize: value
+            .get("ancestorsize")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        time: value
+            .get("time")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+/// Build the index entry for one raw mempool transaction.
+pub fn build_tx(
+    raw: Vec<u8>,
+    info: &MempoolEntryInfo,
+) -> Result<MempoolTx, bindex::fmt::Error> {
+    let parsed = bindex::fmt::parse_tx(&raw)?;
+    let mut touches = BTreeSet::new();
+    let mut outputs = BTreeMap::new();
+    for (vout, output) in parsed.outputs.iter().enumerate() {
+        let scripthash = ElectrumScripthash::from_script(bitcoin::Script::from_bytes(
+            &output.script_pubkey,
+        ));
+        touches.insert(scripthash);
+        outputs.insert(vout as u32, (scripthash, output.value));
+    }
+    Ok(MempoolTx {
+        txid: parsed.txid,
+        raw,
+        fee: info.fee,
+        vsize: info.vsize,
+        ancestor_fees: info.ancestor_fees,
+        ancestor_vsize: info.ancestor_vsize,
+        touches,
+        spends: parsed.inputs.iter().copied().collect(),
+        outputs,
+    })
+}
+
+/// One mempool refresh: diff the node's mempool against the index, fetch the
+/// bodies of everything new, and swap the result in.
+///
+/// Only the arrivals are fetched, one `/rest/tx` round trip each, spread over a
+/// few threads; a steady-state poll costs as many requests as there were new
+/// transactions. Prevouts are deliberately *not* resolved here — an input is
+/// attributed to a script by looking its outpoint up in that script's UTXO set
+/// at query time, which keeps the poll to one request per transaction.
+pub fn poll_once(
+    core: &CoreRest,
+    index: &RwLock<MempoolIndex>,
+    recent_cap: usize,
+    workers: usize,
+) -> anyhow::Result<(usize, usize)> {
+    let contents = core.mempool_contents()?;
+    let entries = contents
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("mempool contents is not an object"))?;
+
+    let known: BTreeSet<Txid> = index
+        .read()
+        .map_err(|_| anyhow::anyhow!("mempool lock poisoned"))?
+        .txs
+        .keys()
+        .copied()
+        .collect();
+
+    let mut current = BTreeSet::new();
+    let mut wanted = Vec::new();
+    for (txid, entry) in entries {
+        let Ok(txid) = txid.parse::<Txid>() else {
+            continue;
+        };
+        current.insert(txid);
+        if !known.contains(&txid) {
+            wanted.push((txid, parse_entry(entry)));
+        }
+    }
+    let removed: Vec<Txid> = known.difference(&current).copied().collect();
+
+    let workers = workers.max(1).min(wanted.len().max(1));
+    let chunk = wanted.len().div_ceil(workers).max(1);
+    let fetched: Vec<(MempoolTx, MempoolEntryInfo)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = wanted
+            .chunks(chunk)
+            .map(|slice| {
+                scope.spawn(move || {
+                    let mut out = Vec::with_capacity(slice.len());
+                    for (txid, info) in slice {
+                        // a transaction can leave the mempool mid-poll
+                        let Ok(raw) = core.tx_raw(txid) else {
+                            continue;
+                        };
+                        match build_tx(raw, info) {
+                            Ok(tx) if tx.txid == *txid => out.push((tx, info.clone())),
+                            Ok(tx) => log::warn!("mempool tx {txid} decoded as {}", tx.txid),
+                            Err(err) => log::warn!("mempool tx {txid} failed to decode: {err}"),
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .flatten()
+            .collect()
+    });
+
+    let mut arrivals = fetched;
+    arrivals.sort_by_key(|(_, info)| info.time);
+
+    let mut index = index
+        .write()
+        .map_err(|_| anyhow::anyhow!("mempool lock poisoned"))?;
+    for txid in &removed {
+        index.remove(txid);
+    }
+    let added = arrivals.len();
+    for (tx, _) in arrivals {
+        let entry = RecentTx {
+            txid: tx.txid.to_string(),
+            fee: tx.fee,
+            vsize: tx.vsize,
+            value: tx.value(),
+        };
+        index.insert(tx);
+        index.push_recent(entry, recent_cap);
+    }
+    Ok((added, removed.len()))
 }
 
 #[cfg(test)]
@@ -148,5 +434,66 @@ mod tests {
         assert_eq!(index.entries(sh).len(), 1);
         assert!(index.remove(&txid).is_some());
         assert!(index.entries(sh).is_empty());
+    }
+
+    #[test]
+    fn verbose_entries_convert_to_satoshis() {
+        let entry = serde_json::json!({
+            "vsize": 141,
+            "time": 1700000000u64,
+            "ancestorsize": 141,
+            "fees": {"base": 0.00000282, "ancestor": 0.00000282},
+        });
+        let info = parse_entry(&entry);
+        assert_eq!(info.fee, 282);
+        assert_eq!(info.vsize, 141);
+        assert_eq!(info.ancestor_fees, 282);
+        assert_eq!(info.time, 1_700_000_000);
+    }
+
+    #[test]
+    fn recent_queue_is_newest_first_and_bounded() {
+        let mut index = MempoolIndex::default();
+        for i in 0..5u8 {
+            index.push_recent(
+                RecentTx {
+                    txid: i.to_string(),
+                    fee: i as u64,
+                    vsize: 1,
+                    value: 1,
+                },
+                3,
+            );
+        }
+        let recent = index.recent();
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].txid, "4");
+        assert_eq!(recent[2].txid, "2");
+    }
+
+    #[test]
+    fn fee_histogram_bins_descend_by_rate() {
+        let mut index = MempoolIndex::default();
+        for (i, (fee, vsize)) in [(10_000u64, 1_000u64), (100, 1_000), (1_000, 60_000)]
+            .into_iter()
+            .enumerate()
+        {
+            index.insert(MempoolTx {
+                txid: Txid::from_raw_hash(sha256d::Hash::hash(&[i as u8])),
+                raw: vec![],
+                fee,
+                vsize,
+                ancestor_fees: fee,
+                ancestor_vsize: vsize,
+                touches: BTreeSet::new(),
+                spends: BTreeSet::new(),
+                outputs: BTreeMap::new(),
+            });
+        }
+        let bins = index.fee_histogram_bins();
+        assert!(!bins.is_empty());
+        assert!(bins.windows(2).all(|pair| pair[0].0 >= pair[1].0), "{bins:?}");
+        let total: u64 = bins.iter().map(|(_, vsize)| *vsize as u64).sum();
+        assert_eq!(total, 62_000);
     }
 }

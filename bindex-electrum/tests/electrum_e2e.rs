@@ -3,7 +3,7 @@ use std::future;
 
 use anyhow::Context as _;
 use bindex_electrum::{
-    config::{BroadcastVia, Config},
+    config::{BroadcastVia, Config, RestConfig},
     protocol::{ElectrumScripthash, ProtocolVersion},
     server::Server,
 };
@@ -115,6 +115,7 @@ async fn electrum_server_serves_synced_regtest_chain() -> anyhow::Result<()> {
         network: Network::Regtest,
         db_name: None,
         bindex_db_path: db_dir.path().to_path_buf(),
+        secondary_path: None,
         bitcoind_rest_url: rest_url,
         bitcoind_rpc_url: format!("http://{}", node.params.rpc_socket),
         bitcoind_rpc_user: None,
@@ -143,6 +144,7 @@ async fn electrum_server_serves_synced_regtest_chain() -> anyhow::Result<()> {
         banner: "bindex electrum test".to_string(),
         peer: Vec::new(),
         donation_address: None,
+        rest: RestConfig::default(),
     };
     let server = Server::new(config)?;
     let server_task =
