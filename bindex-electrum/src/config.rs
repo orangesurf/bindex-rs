@@ -130,10 +130,13 @@ pub struct Config {
     pub rest: RestConfig,
 }
 
-/// Esplora-compatible REST API (off unless `--http-addr` is given).
-///
-/// The defaults mirror the mempool/electrs REST server this API is modelled on.
+// Esplora-compatible REST API (off unless `--http-addr` is given). The defaults
+// mirror the mempool/electrs REST server this API is modelled on.
+//
+// Deliberately not a doc comment: clap would promote it to the binary's `about`
+// text. The flags get their own `--help` section instead.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[command(next_help_heading = "REST API")]
 pub struct RestConfig {
     /// Serve the Esplora-compatible REST API on this address.
     #[arg(long)]
@@ -182,6 +185,31 @@ pub struct RestConfig {
     /// Hardcoded in the reference; kept configurable for tests.
     #[arg(long, default_value_t = 100)]
     pub rest_max_history_txs: usize,
+
+    /// Give up on a REST request after this many seconds (0 disables).
+    #[arg(long, default_value_t = 30)]
+    pub rest_request_timeout_secs: u64,
+
+    /// How many expensive REST queries (history folds, spender scans,
+    /// whole-block transaction lists) may run at once.
+    #[arg(long, default_value_t = 4)]
+    pub rest_max_concurrent_queries: usize,
+
+    /// Maximum simultaneously open REST connections.
+    #[arg(long, default_value_t = 100)]
+    pub rest_max_connections: usize,
+
+    /// Time a client gets to send a complete request head and body.
+    #[arg(long, default_value_t = 10)]
+    pub rest_header_timeout_secs: u64,
+
+    /// Time a kept-alive REST connection may sit idle between requests.
+    #[arg(long, default_value_t = 30)]
+    pub rest_idle_timeout_secs: u64,
+
+    /// Largest REST request body accepted.
+    #[arg(long, default_value_t = 20_000_200)]
+    pub request_body_bytes_cap: usize,
 }
 
 impl Default for RestConfig {
@@ -199,6 +227,12 @@ impl Default for RestConfig {
             utxos_limit: 500,
             mempool_recent_txs_size: 10,
             rest_max_history_txs: 100,
+            rest_request_timeout_secs: 30,
+            rest_max_concurrent_queries: 4,
+            rest_max_connections: 100,
+            rest_header_timeout_secs: 10,
+            rest_idle_timeout_secs: 30,
+            request_body_bytes_cap: 20_000_200,
         }
     }
 }
@@ -207,6 +241,18 @@ impl RestConfig {
     /// `capped_max_txs`: the `?max_txs` query parameter, defaulted then capped.
     pub fn capped_max_txs(&self, requested: Option<usize>, default: usize, cap: usize) -> usize {
         requested.unwrap_or(default).min(cap)
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.rest_request_timeout_secs)
+    }
+
+    pub fn header_timeout(&self) -> Duration {
+        Duration::from_secs(self.rest_header_timeout_secs)
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.rest_idle_timeout_secs)
     }
 }
 

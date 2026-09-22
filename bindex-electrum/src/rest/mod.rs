@@ -22,20 +22,43 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::sync::Semaphore;
+
 use anyhow::Context as _;
 use bitcoin::Network;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::{io::BufReader, net::TcpListener};
+use tokio::{
+    io::{AsyncBufReadExt as _, BufReader},
+    net::TcpListener,
+};
 
 use crate::{
     config::RestConfig,
     server::Server,
 };
 
-use crate::corerest::{self, CoreRest};
+use crate::{
+    corerest::{self, CoreRest},
+    deadline::Deadline,
+};
 
 use self::http::{HttpRequest, HttpResponse, IdentityHeaders};
+
+/// One in-flight request: what the client sent, plus when the server must give
+/// up on it. Derefs to the parsed request, so handlers read it as before.
+pub struct Req<'a> {
+    pub http: &'a HttpRequest,
+    pub deadline: Deadline,
+}
+
+impl std::ops::Deref for Req<'_> {
+    type Target = HttpRequest;
+
+    fn deref(&self) -> &Self::Target {
+        self.http
+    }
+}
 
 /// Static or final data: ~5 years.
 pub const TTL_LONG: u32 = 157_784_630;
@@ -102,7 +125,13 @@ impl HttpError {
 
 impl From<crate::chain::Error> for HttpError {
     fn from(err: crate::chain::Error) -> Self {
-        HttpError::server_error(err.to_string())
+        match err {
+            // the query ran out of time: 504, as a gateway that gave up
+            crate::chain::Error::Deadline => HttpError::new(504, err.to_string()),
+            // the chain moved under it repeatedly: transient, ask again
+            crate::chain::Error::Reorg => HttpError::new(503, err.to_string()),
+            other => HttpError::server_error(other.to_string()),
+        }
     }
 }
 
@@ -143,6 +172,13 @@ pub struct RestApi {
     pub config: RestConfig,
     identity: RwLock<IdentityHeaders>,
     fee_cache: Mutex<Option<(Instant, Value)>>,
+    /// Bounds how many history folds, spender scans and whole-block
+    /// transaction builds run at once, so they cannot crowd out the cheap
+    /// routes (or the node) when several land together.
+    queries: Semaphore,
+    /// Bounds open connections, so a client that opens sockets and never
+    /// finishes a request cannot exhaust the server.
+    connections: Arc<Semaphore>,
 }
 
 impl RestApi {
@@ -162,6 +198,8 @@ impl RestApi {
         };
         Arc::new(Self {
             network,
+            queries: Semaphore::new(rest.rest_max_concurrent_queries.max(1)),
+            connections: Arc::new(Semaphore::new(rest.rest_max_connections.max(1))),
             config: rest,
             core: CoreRest::new(rest_url),
             identity: RwLock::new(identity),
@@ -208,13 +246,47 @@ impl RestApi {
     }
 
     async fn respond(&self, request: &HttpRequest) -> HttpResponse {
+        let deadline = Deadline::after(self.config.request_timeout());
+        let expensive = handlers::is_expensive(&request.method, &request.segments());
+
+        // queue the expensive routes; a cheap one must stay answerable while a
+        // hot address is being replayed
+        let _permit = if expensive {
+            let wait = deadline.remaining().unwrap_or(Duration::from_secs(30));
+            match tokio::time::timeout(wait, self.queries.acquire()).await {
+                Ok(Ok(permit)) => Some(permit),
+                Ok(Err(_)) => return HttpError::new(503, "server shutting down").into_response(),
+                Err(_) => {
+                    return HttpError::new(503, "too many concurrent queries").into_response()
+                }
+            }
+        } else {
+            None
+        };
+
+        let request = &Req {
+            http: request,
+            deadline,
+        };
         match handlers::route(self, request).await {
             Ok(response) => response,
             Err(err) => {
                 if err.status >= 500 {
-                    log::warn!("{} {} -> {}: {}", request.method, request.path, err.status, err.message);
+                    log::warn!(
+                        "{} {} -> {}: {}",
+                        request.method,
+                        request.path,
+                        err.status,
+                        err.message
+                    );
                 } else {
-                    log::debug!("{} {} -> {}: {}", request.method, request.path, err.status, err.message);
+                    log::debug!(
+                        "{} {} -> {}: {}",
+                        request.method,
+                        request.path,
+                        err.status,
+                        err.message
+                    );
                 }
                 err.into_response()
             }
@@ -237,7 +309,13 @@ pub async fn run_listener(api: Arc<RestApi>, listener: TcpListener) -> anyhow::R
     loop {
         let (stream, peer) = listener.accept().await?;
         let api = Arc::clone(&api);
+        let Ok(permit) = Arc::clone(&api.connections).try_acquire_owned() else {
+            log::debug!("refusing REST connection from {peer}: connection limit reached");
+            tokio::spawn(async move { refuse(api, stream).await });
+            continue;
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = handle_connection(api, stream).await {
                 log::debug!("REST connection from {peer} ended: {err}");
             }
@@ -245,13 +323,61 @@ pub async fn run_listener(api: Arc<RestApi>, listener: TcpListener) -> anyhow::R
     }
 }
 
+/// Answer a connection we have no capacity for, rather than dropping it.
+async fn refuse(api: Arc<RestApi>, stream: tokio::net::TcpStream) {
+    let (_, mut writer) = stream.into_split();
+    let response = HttpError::new(503, "too many connections").into_response();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        http::write_response(&mut writer, &response, &api.identity(), false),
+    )
+    .await;
+}
+
 async fn handle_connection(api: Arc<RestApi>, stream: tokio::net::TcpStream) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+    let header_timeout = api.config.header_timeout();
+    let idle_timeout = api.config.idle_timeout();
+    let mut first = true;
+
     loop {
-        let Some(request) = http::read_request(&mut reader).await? else {
-            return Ok(());
+        // A connection that has said nothing yet gets the header timeout; one
+        // waiting for its next pipelined request gets the idle timeout. Either
+        // way a half-sent request cannot hold the slot open indefinitely.
+        let wait = if first { header_timeout } else { idle_timeout };
+        match tokio::time::timeout(wait, reader.fill_buf()).await {
+            Err(_) => return Ok(()),
+            Ok(Ok(buf)) if buf.is_empty() => return Ok(()),
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => return Err(err),
+        }
+        first = false;
+
+        let outcome = match tokio::time::timeout(
+            header_timeout,
+            http::read_request(&mut reader, api.config.request_body_bytes_cap),
+        )
+        .await
+        {
+            Ok(outcome) => outcome?,
+            Err(_) => {
+                let response = HttpError::new(408, "request timed out").into_response();
+                http::write_response(&mut writer, &response, &api.identity(), false).await?;
+                return Ok(());
+            }
         };
+
+        let request = match outcome {
+            http::ReadOutcome::Closed => return Ok(()),
+            http::ReadOutcome::Invalid { status, message } => {
+                let response = HttpError::new(status, message).into_response();
+                http::write_response(&mut writer, &response, &api.identity(), false).await?;
+                return Ok(());
+            }
+            http::ReadOutcome::Request(request) => request,
+        };
+
         let keep_alive = request.keep_alive;
         let response = api.respond(&request).await;
         http::write_response(&mut writer, &response, &api.identity(), keep_alive).await?;

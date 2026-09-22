@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::{
     corerest,
+    deadline::Deadline,
     protocol::ElectrumScripthash,
     rest::{
         http::HttpRequest,
@@ -18,6 +19,14 @@ use crate::{
         HttpError, RestApi, Result,
     },
 };
+
+/// Give up with a 504 once the request's deadline has passed.
+pub fn check_deadline(deadline: &Deadline) -> Result<()> {
+    if deadline.expired() {
+        return Err(HttpError::new(504, "request deadline exceeded"));
+    }
+    Ok(())
+}
 
 pub fn parse_usize(value: &str) -> Result<usize> {
     value
@@ -222,11 +231,13 @@ pub fn block_tx_values(
     hash: &BlockHash,
     status: &TransactionStatus,
     range: std::ops::Range<usize>,
+    deadline: &Deadline,
 ) -> Result<Vec<TransactionValue>> {
     let (txs, spent) = block_transactions(api, hash)?;
     let end = range.end.min(txs.len());
     let mut out = Vec::new();
     for index in range.start.min(end)..end {
+        check_deadline(deadline)?;
         let tx = &txs[index];
         let prevouts = align_prevouts(tx, &spent[index]);
         if !tx.is_coinbase() && prevouts.iter().any(Option::is_none) {

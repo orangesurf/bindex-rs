@@ -4,11 +4,12 @@ use bitcoin::{OutPoint, Transaction, Txid};
 use serde_json::Value;
 
 use crate::{
+    deadline::Deadline,
     merkle,
     protocol::ElectrumScripthash,
     rest::{
         address,
-        http::{HttpRequest, HttpResponse},
+        http::HttpResponse,
         json,
         query::{self, FoundTx},
         text,
@@ -16,7 +17,7 @@ use crate::{
             merkleblock_hex, BlockStatus, BlockValue, MempoolInfo, MerkleProof, SpendingValue,
             TransactionStatus, TransactionValue,
         },
-        ttl_by_depth, HttpError, RestApi, Result, TTL_LONG, TTL_SHORT,
+        ttl_by_depth, HttpError, Req, RestApi, Result, TTL_LONG, TTL_SHORT,
     },
 };
 
@@ -41,7 +42,7 @@ const CONF_TARGETS: &[usize] = &[
 /// Everything but broadcasting is blocking (index reads and bitcoind round
 /// trips), so it runs under `block_in_place`; the REST server therefore needs a
 /// multi-threaded runtime, which is what `main` and the tests use.
-pub async fn route(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+pub async fn route(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let segments = request.segments();
     // the routes that talk to bitcoind (or to the onion push endpoint) are async
     match (request.method.as_str(), segments.as_slice()) {
@@ -55,9 +56,29 @@ pub async fn route(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse>
     tokio::task::block_in_place(|| route_blocking(api, request, &segments))
 }
 
+/// Routes that can replay a whole script history, scan for a spender, or build
+/// every transaction of a block or of the mempool. These queue behind the query
+/// semaphore; everything else answers from the header index or the mempool
+/// index in memory and must stay available while they run.
+pub(crate) fn is_expensive(method: &str, segments: &[&str]) -> bool {
+    matches!(
+        (method, segments),
+        ("GET", ["block", _, "txs", ..])
+            | ("GET", ["internal", "block", _, "txs"])
+            | ("GET", ["tx", _, "outspend", _])
+            | ("GET", ["tx", _, "outspends"])
+            | ("GET", ["txs", "outspends"])
+            | ("POST", ["internal", "txs", ..])
+            | ("GET", ["address" | "scripthash", ..])
+            | ("POST", ["addresses" | "scripthashes", ..])
+            | ("GET", ["internal", "mempool", "txs", ..])
+            | ("POST", ["internal", "mempool", "txs"])
+    )
+}
+
 fn route_blocking(
     api: &RestApi,
-    request: &HttpRequest,
+    request: &Req<'_>,
     segments: &[&str],
 ) -> Result<HttpResponse> {
     match (request.method.as_str(), segments) {
@@ -72,9 +93,9 @@ fn route_blocking(
         ("GET", ["block", hash, "header"]) => block_header(api, hash),
         ("GET", ["block", hash, "raw"]) => block_raw(api, hash),
         ("GET", ["block", hash, "txid", index]) => block_txid_at(api, hash, index),
-        ("GET", ["block", hash, "txs"]) => block_txs(api, hash, None),
-        ("GET", ["block", hash, "txs", start]) => block_txs(api, hash, Some(start)),
-        ("GET", ["internal", "block", hash, "txs"]) => internal_block_txs(api, hash),
+        ("GET", ["block", hash, "txs"]) => block_txs(api, request, hash, None),
+        ("GET", ["block", hash, "txs", start]) => block_txs(api, request, hash, Some(start)),
+        ("GET", ["internal", "block", hash, "txs"]) => internal_block_txs(api, request, hash),
 
         ("GET", ["tx", txid]) => tx(api, txid),
         ("GET", ["tx", txid, "hex"]) => tx_hex(api, txid),
@@ -82,8 +103,8 @@ fn route_blocking(
         ("GET", ["tx", txid, "status"]) => tx_status(api, txid),
         ("GET", ["tx", txid, "merkle-proof"]) => tx_merkle_proof(api, txid),
         ("GET", ["tx", txid, "merkleblock-proof"]) => tx_merkleblock_proof(api, txid),
-        ("GET", ["tx", txid, "outspend", vout]) => tx_outspend(api, txid, vout),
-        ("GET", ["tx", txid, "outspends"]) => tx_outspends(api, txid),
+        ("GET", ["tx", txid, "outspend", vout]) => tx_outspend(api, request, txid, vout),
+        ("GET", ["tx", txid, "outspends"]) => tx_outspends(api, request, txid),
         ("GET", ["txs", "outspends"]) => txs_outspends(api, request),
         ("POST", ["internal", "txs"]) => internal_txs(api, request),
         ("POST", ["internal", "txs", "outspends", "by-txid"]) => {
@@ -122,7 +143,7 @@ fn route_blocking(
 }
 
 /// The reference's fallthrough: no 405, a wrong method is just an unknown path.
-pub(crate) fn unrouted(request: &HttpRequest) -> HttpError {
+pub(crate) fn unrouted(request: &Req<'_>) -> HttpError {
     HttpError::not_found(format!("endpoint does not exist {:?}", request.raw_target))
 }
 
@@ -242,7 +263,7 @@ fn block_txid_at(api: &RestApi, hash: &str, index: &str) -> Result<HttpResponse>
     Ok(text(txid.to_string(), TTL_LONG))
 }
 
-fn block_txs(api: &RestApi, hash: &str, start: Option<&str>) -> Result<HttpResponse> {
+fn block_txs(api: &RestApi, request: &Req<'_>, hash: &str, start: Option<&str>) -> Result<HttpResponse> {
     let hash = query::parse_block_hash(hash)?;
     let page = api.config.rest_default_chain_txs_per_page.max(1);
     let start = start.map(query::parse_usize).transpose()?.unwrap_or(0);
@@ -258,7 +279,7 @@ fn block_txs(api: &RestApi, hash: &str, start: Option<&str>) -> Result<HttpRespo
         )));
     }
 
-    let values = query::block_tx_values(api, &hash, &status, start..start + page)?;
+    let values = query::block_tx_values(api, &hash, &status, start..start + page, &request.deadline)?;
     let tip = query::tip_height(api)?;
     let ttl = if in_best_chain {
         ttl_by_depth(Some(height), tip)
@@ -268,10 +289,10 @@ fn block_txs(api: &RestApi, hash: &str, start: Option<&str>) -> Result<HttpRespo
     json(&values, ttl)
 }
 
-fn internal_block_txs(api: &RestApi, hash: &str) -> Result<HttpResponse> {
+fn internal_block_txs(api: &RestApi, request: &Req<'_>, hash: &str) -> Result<HttpResponse> {
     let hash = query::parse_block_hash(hash)?;
     let (status, tx_count, in_best_chain, height) = block_context(api, &hash)?;
-    let values = query::block_tx_values(api, &hash, &status, 0..tx_count)?;
+    let values = query::block_tx_values(api, &hash, &status, 0..tx_count, &request.deadline)?;
     let tip = query::tip_height(api)?;
     let ttl = if in_best_chain {
         ttl_by_depth(Some(height), tip)
@@ -397,10 +418,10 @@ fn tx_merkleblock_proof(api: &RestApi, txid: &str) -> Result<HttpResponse> {
     Ok(text(proof, ttl_by_depth(Some(height), tip)))
 }
 
-fn tx_outspend(api: &RestApi, txid: &str, vout: &str) -> Result<HttpResponse> {
+fn tx_outspend(api: &RestApi, request: &Req<'_>, txid: &str, vout: &str) -> Result<HttpResponse> {
     let txid = query::parse_txid(txid)?;
     let vout = query::parse_u32(vout)?;
-    let spending = outspend(api, &txid, vout)?;
+    let spending = outspend(api, &txid, vout, &request.deadline)?;
     let tip = query::tip_height(api)?;
     let ttl = ttl_by_depth(
         spending.status.as_ref().and_then(TransactionStatus::height),
@@ -409,13 +430,13 @@ fn tx_outspend(api: &RestApi, txid: &str, vout: &str) -> Result<HttpResponse> {
     json(&spending, ttl)
 }
 
-fn tx_outspends(api: &RestApi, txid: &str) -> Result<HttpResponse> {
+fn tx_outspends(api: &RestApi, request: &Req<'_>, txid: &str) -> Result<HttpResponse> {
     let txid = query::parse_txid(txid)?;
     let found = found_tx(api, &txid)?;
-    json(&outspends_of(api, &txid, &found.tx)?, TTL_SHORT)
+    json(&outspends_of(api, &txid, &found.tx, &request.deadline)?, TTL_SHORT)
 }
 
-fn txs_outspends(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+fn txs_outspends(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let Some(param) = request.param("txids") else {
         return Err(HttpError::bad_request("No txids specified"));
     };
@@ -425,15 +446,16 @@ fn txs_outspends(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
     }
     let mut out = Vec::with_capacity(txids.len());
     for txid in txids {
-        out.push(outspends_or_empty(api, txid)?);
+        out.push(outspends_or_empty(api, txid, &request.deadline)?);
     }
     json(&out, TTL_SHORT)
 }
 
-fn internal_txs(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+fn internal_txs(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let txids = txid_body(request)?;
     let mut out = Vec::new();
     for txid in txids {
+        query::check_deadline(&request.deadline)?;
         if let Some(value) = query::tx_value_opt(api, &txid)? {
             out.push(value);
         }
@@ -441,25 +463,25 @@ fn internal_txs(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
     json(&out, 0)
 }
 
-fn internal_outspends_by_txid(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+fn internal_outspends_by_txid(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let txids = txid_body(request)?;
     let mut out = Vec::with_capacity(txids.len());
     for txid in txids {
         out.push(match query::find_tx(api, &txid)? {
-            Some(found) => outspends_of(api, &txid, &found.tx)?,
+            Some(found) => outspends_of(api, &txid, &found.tx, &request.deadline)?,
             None => Vec::new(),
         });
     }
     json(&out, TTL_SHORT)
 }
 
-fn internal_outspends_by_outpoint(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+fn internal_outspends_by_outpoint(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let outpoints: Vec<String> = serde_json::from_slice(&request.body)
         .map_err(|err| HttpError::bad_request(err.to_string()).cached(0))?;
     let mut out = Vec::with_capacity(outpoints.len());
     for entry in outpoints {
         out.push(match parse_outpoint(&entry) {
-            Some(outpoint) => outspend(api, &outpoint.txid, outpoint.vout)?,
+            Some(outpoint) => outspend(api, &outpoint.txid, outpoint.vout, &request.deadline)?,
             None => SpendingValue::unspent(),
         });
     }
@@ -472,7 +494,7 @@ fn found_tx(api: &RestApi, txid: &Txid) -> Result<FoundTx> {
     query::find_tx(api, txid)?.ok_or_else(|| HttpError::not_found("Transaction not found"))
 }
 
-fn txid_body(request: &HttpRequest) -> Result<Vec<Txid>> {
+fn txid_body(request: &Req<'_>) -> Result<Vec<Txid>> {
     let raw: Vec<String> = serde_json::from_slice(&request.body)
         .map_err(|err| HttpError::bad_request(err.to_string()).cached(0))?;
     raw.iter()
@@ -525,7 +547,13 @@ fn confirmed_block_position(
 /// output is indexed under that output's scripthash, from the funding block
 /// onwards. The cost is therefore proportional to how often the script has been
 /// reused, which is why this is the one route that can be slow on a hot address.
-fn outspend(api: &RestApi, txid: &Txid, vout: u32) -> Result<SpendingValue> {
+fn outspend(
+    api: &RestApi,
+    txid: &Txid,
+    vout: u32,
+    deadline: &Deadline,
+) -> Result<SpendingValue> {
+    query::check_deadline(deadline)?;
     let Some(found) = query::find_tx(api, txid)? else {
         return Ok(SpendingValue::unspent());
     };
@@ -571,7 +599,7 @@ fn outspend(api: &RestApi, txid: &Txid, vout: u32) -> Result<SpendingValue> {
     let Some(spender) = api
         .server
         .chain()
-        .find_spender(outpoint, scripthash, funding_height)?
+        .find_spender(outpoint, scripthash, funding_height, deadline)?
     else {
         return Ok(SpendingValue::unspent());
     };
@@ -583,18 +611,27 @@ fn outspend(api: &RestApi, txid: &Txid, vout: u32) -> Result<SpendingValue> {
     ))
 }
 
-fn outspends_of(api: &RestApi, txid: &Txid, tx: &Transaction) -> Result<Vec<SpendingValue>> {
+fn outspends_of(
+    api: &RestApi,
+    txid: &Txid,
+    tx: &Transaction,
+    deadline: &Deadline,
+) -> Result<Vec<SpendingValue>> {
     (0..tx.output.len() as u32)
-        .map(|vout| outspend(api, txid, vout))
+        .map(|vout| outspend(api, txid, vout, deadline))
         .collect()
 }
 
-fn outspends_or_empty(api: &RestApi, txid: &str) -> Result<Vec<SpendingValue>> {
+fn outspends_or_empty(
+    api: &RestApi,
+    txid: &str,
+    deadline: &Deadline,
+) -> Result<Vec<SpendingValue>> {
     let Ok(txid) = query::parse_txid(txid) else {
         return Ok(Vec::new());
     };
     match query::find_tx(api, &txid)? {
-        Some(found) => outspends_of(api, &txid, &found.tx),
+        Some(found) => outspends_of(api, &txid, &found.tx, deadline),
         None => Ok(Vec::new()),
     }
 }
@@ -602,13 +639,13 @@ fn outspends_or_empty(api: &RestApi, txid: &str) -> Result<Vec<SpendingValue>> {
 // ---------------------------------------------------------------- broadcast
 
 /// `POST /tx` takes the raw hex as the body, not as JSON.
-async fn post_tx(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+async fn post_tx(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let raw = String::from_utf8(request.body.clone())
         .map_err(|err| HttpError::bad_request(err.to_string()))?;
     broadcast(api, raw.trim()).await
 }
 
-async fn get_broadcast(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+async fn get_broadcast(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let raw = request
         .param("tx")
         .ok_or_else(|| HttpError::bad_request("Missing tx"))?
@@ -632,7 +669,7 @@ async fn broadcast(api: &RestApi, raw_tx_hex: &str) -> Result<HttpResponse> {
     Ok(HttpResponse::text(200, txid, Some(0)))
 }
 
-async fn txs_test(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+async fn txs_test(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let txs = submitted_txs(request)?;
     let maxfeerate = amount_param(request, "maxfeerate")?;
     check_tx_hex(&txs)?;
@@ -649,7 +686,7 @@ async fn txs_test(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> 
     json(&result, TTL_SHORT)
 }
 
-async fn txs_package(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+async fn txs_package(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let txs = submitted_txs(request)?;
     let maxfeerate = amount_param(request, "maxfeerate")?;
     let maxburnamount = amount_param(request, "maxburnamount")?;
@@ -712,7 +749,7 @@ async fn fee_estimates(api: &RestApi) -> Result<HttpResponse> {
 }
 
 /// The count check comes first, then the parameters, then the per-item checks.
-fn submitted_txs(request: &HttpRequest) -> Result<Vec<String>> {
+fn submitted_txs(request: &Req<'_>) -> Result<Vec<String>> {
     let txs: Vec<String> = serde_json::from_slice(&request.body)
         .map_err(|err| HttpError::bad_request(err.to_string()))?;
     if txs.len() > MAX_SUBMIT_TXS {
@@ -735,7 +772,7 @@ fn check_tx_hex(txs: &[String]) -> Result<()> {
 }
 
 /// A BTC amount query parameter, forwarded to bitcoind with eight decimals.
-fn amount_param(request: &HttpRequest, name: &str) -> Result<Option<String>> {
+fn amount_param(request: &Req<'_>, name: &str) -> Result<Option<String>> {
     let Some(raw) = request.param(name) else {
         return Ok(None);
     };
@@ -787,7 +824,7 @@ fn mempool_txids(api: &RestApi) -> Result<HttpResponse> {
 
 fn mempool_txids_page(
     api: &RestApi,
-    request: &HttpRequest,
+    request: &Req<'_>,
     cursor: Option<&str>,
 ) -> Result<HttpResponse> {
     let limit = api.config.capped_max_txs(
@@ -807,7 +844,7 @@ fn mempool_recent(api: &RestApi) -> Result<HttpResponse> {
 
 fn internal_mempool_txs(
     api: &RestApi,
-    request: &HttpRequest,
+    request: &Req<'_>,
     cursor: Option<&str>,
 ) -> Result<HttpResponse> {
     let limit = api.config.capped_max_txs(
@@ -816,15 +853,15 @@ fn internal_mempool_txs(
         api.config.rest_max_mempool_page_size,
     );
     let page = paged_txids(api, cursor, limit)?;
-    json(&mempool_tx_values(api, &page)?, TTL_SHORT)
+    json(&mempool_tx_values(api, &page, &request.deadline)?, TTL_SHORT)
 }
 
 fn internal_mempool_txs_all(api: &RestApi) -> Result<HttpResponse> {
     let txids = sorted_mempool_txids(api);
-    json(&mempool_tx_values(api, &txids)?, TTL_SHORT)
+    json(&mempool_tx_values(api, &txids, &Deadline::never())?, TTL_SHORT)
 }
 
-fn internal_mempool_txs_batch(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+fn internal_mempool_txs_batch(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
     let requested = txid_body(request)?;
     let known: Vec<Txid> = {
         let mempool = api.server.mempool().read().expect("mempool lock");
@@ -833,7 +870,7 @@ fn internal_mempool_txs_batch(api: &RestApi, request: &HttpRequest) -> Result<Ht
             .filter(|txid| mempool.contains(txid))
             .collect()
     };
-    json(&mempool_tx_values(api, &known)?, 0)
+    json(&mempool_tx_values(api, &known, &request.deadline)?, 0)
 }
 
 fn sorted_mempool_txids(api: &RestApi) -> Vec<Txid> {
@@ -865,9 +902,14 @@ fn paged_txids(api: &RestApi, cursor: Option<&str>, limit: usize) -> Result<Vec<
         .collect())
 }
 
-fn mempool_tx_values(api: &RestApi, txids: &[Txid]) -> Result<Vec<TransactionValue>> {
+fn mempool_tx_values(
+    api: &RestApi,
+    txids: &[Txid],
+    deadline: &Deadline,
+) -> Result<Vec<TransactionValue>> {
     let mut out = Vec::with_capacity(txids.len());
     for txid in txids {
+        query::check_deadline(deadline)?;
         if let Some(value) = query::tx_value_opt(api, txid)? {
             out.push(value);
         }

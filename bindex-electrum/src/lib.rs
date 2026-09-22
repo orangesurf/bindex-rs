@@ -3,6 +3,7 @@ pub mod cache;
 pub mod chain;
 pub mod config;
 pub mod corerest;
+pub mod deadline;
 pub mod mempool;
 pub mod merkle;
 pub mod monitor;

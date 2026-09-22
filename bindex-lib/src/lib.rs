@@ -12,6 +12,22 @@ mod headers;
 mod index;
 
 pub use chain::{Config as ChainConfig, Error as ChainError, IndexedChain, Stats};
+
+/// Where a transaction's bytes live, without fetching them.
+///
+/// Resolving a [`Location`] to this is a pure index lookup, so a caller holding
+/// a lock over the index can release it before paying for the (much slower)
+/// body fetch from the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxBytesRef {
+    pub block_hash: bitcoin::BlockHash,
+    pub block_height: usize,
+    /// Transaction index within its block.
+    pub block_position: u32,
+    /// Byte offset of the transaction within the raw block.
+    pub offset: u32,
+    pub size: u32,
+}
 pub use index::IndexedHeader;
 pub use headers::Headers;
 pub use index::ScriptHash;

@@ -16,13 +16,14 @@ use serde::Serialize;
 
 use crate::{
     chain::{ScriptHistory, ScriptUtxo},
+    deadline::Deadline,
     protocol::ElectrumScripthash,
     rest::{
-        http::{HttpRequest, HttpResponse},
+        http::HttpResponse,
         json,
         query::{self, ScriptKey},
         types::{ScriptStats, TransactionStatus, TransactionValue, TxHistorySummary, UtxoValue},
-        HttpError, RestApi, Result, TTL_SHORT,
+        HttpError, Req, RestApi, Result, TTL_SHORT,
     },
 };
 
@@ -50,19 +51,19 @@ struct ScripthashStats {
 /// `GET /address/:addr/…` and `GET /scripthash/:hash/…`.
 pub fn get_route(
     api: &RestApi,
-    request: &HttpRequest,
+    request: &Req<'_>,
     key: ScriptKey,
     rest: &[&str],
 ) -> Result<HttpResponse> {
     match rest {
-        [] => stats(api, key),
+        [] => stats(api, key, &request.deadline),
         ["txs"] => txs(api, request, &[key]),
         ["txs", "chain"] => txs_chain(api, request, &[key], None),
         ["txs", "chain", cursor] => txs_chain(api, request, &[key], Some(cursor)),
         ["txs", "mempool"] => txs_mempool(api, request, &[key]),
         ["txs", "summary"] => txs_summary(api, request, &[key], None),
         ["txs", "summary", cursor] => txs_summary(api, request, &[key], Some(cursor)),
-        ["utxo"] => utxo(api, key),
+        ["utxo"] => utxo(api, key, &request.deadline),
         _ => Err(crate::rest::handlers::unrouted(request)),
     }
 }
@@ -70,7 +71,7 @@ pub fn get_route(
 /// `POST /addresses/…` and `POST /scripthashes/…`.
 pub fn post_route(
     api: &RestApi,
-    request: &HttpRequest,
+    request: &Req<'_>,
     prefix: &str,
     rest: &[&str],
 ) -> Result<HttpResponse> {
@@ -97,7 +98,7 @@ pub fn address_prefix(api: &RestApi) -> Result<HttpResponse> {
     ))
 }
 
-fn multi_keys(api: &RestApi, request: &HttpRequest, prefix: &str) -> Result<Vec<ScriptKey>> {
+fn multi_keys(api: &RestApi, request: &Req<'_>, prefix: &str) -> Result<Vec<ScriptKey>> {
     if request.body.len() > MULTI_ADDRESS_BODY_LIMIT {
         return Err(HttpError::unprocessable("body too long"));
     }
@@ -118,9 +119,9 @@ fn multi_keys(api: &RestApi, request: &HttpRequest, prefix: &str) -> Result<Vec<
 
 // ---------------------------------------------------------------- routes
 
-fn stats(api: &RestApi, key: ScriptKey) -> Result<HttpResponse> {
+fn stats(api: &RestApi, key: ScriptKey, deadline: &Deadline) -> Result<HttpResponse> {
     let scripthash = key.electrum()?;
-    let history = api.server.chain().script_history(scripthash)?;
+    let history = api.server.chain().script_history(scripthash, deadline)?;
     let chain_stats = ScriptStats {
         tx_count: history.tx_count(),
         funded_txo_count: history.funded_txo_count,
@@ -149,8 +150,8 @@ fn stats(api: &RestApi, key: ScriptKey) -> Result<HttpResponse> {
     }
 }
 
-fn txs(api: &RestApi, request: &HttpRequest, keys: &[ScriptKey]) -> Result<HttpResponse> {
-    let histories = Histories::load(api, keys)?;
+fn txs(api: &RestApi, request: &Req<'_>, keys: &[ScriptKey]) -> Result<HttpResponse> {
+    let histories = Histories::load(api, keys, &request.deadline)?;
     let limit = api.config.capped_max_txs(
         query::query_usize(request, "max_txs"),
         api.config.rest_default_max_mempool_txs,
@@ -178,16 +179,16 @@ fn txs(api: &RestApi, request: &HttpRequest, keys: &[ScriptKey]) -> Result<HttpR
         },
     };
 
-    json(&tx_values(api, &txids, limit)?, TTL_SHORT)
+    json(&tx_values(api, &txids, limit, &request.deadline)?, TTL_SHORT)
 }
 
 fn txs_chain(
     api: &RestApi,
-    request: &HttpRequest,
+    request: &Req<'_>,
     keys: &[ScriptKey],
     cursor: Option<&str>,
 ) -> Result<HttpResponse> {
-    let histories = Histories::load(api, keys)?;
+    let histories = Histories::load(api, keys, &request.deadline)?;
     let limit = api.config.capped_max_txs(
         query::query_usize(request, "max_txs"),
         api.config.rest_default_chain_txs_per_page,
@@ -203,27 +204,27 @@ fn txs_chain(
         },
         None => chain,
     };
-    json(&tx_values(api, &txids, limit)?, TTL_SHORT)
+    json(&tx_values(api, &txids, limit, &request.deadline)?, TTL_SHORT)
 }
 
-fn txs_mempool(api: &RestApi, request: &HttpRequest, keys: &[ScriptKey]) -> Result<HttpResponse> {
-    let histories = Histories::load(api, keys)?;
+fn txs_mempool(api: &RestApi, request: &Req<'_>, keys: &[ScriptKey]) -> Result<HttpResponse> {
+    let histories = Histories::load(api, keys, &request.deadline)?;
     let limit = api.config.capped_max_txs(
         query::query_usize(request, "max_txs"),
         api.config.rest_default_max_mempool_txs,
         MAX_HISTORY_TXS,
     );
     let txids = histories.mempool_txids(api);
-    json(&tx_values(api, &txids, limit)?, TTL_SHORT)
+    json(&tx_values(api, &txids, limit, &request.deadline)?, TTL_SHORT)
 }
 
 fn txs_summary(
     api: &RestApi,
-    request: &HttpRequest,
+    request: &Req<'_>,
     keys: &[ScriptKey],
     cursor: Option<&str>,
 ) -> Result<HttpResponse> {
-    let histories = Histories::load(api, keys)?;
+    let histories = Histories::load(api, keys, &request.deadline)?;
     let limit = api.config.capped_max_txs(
         query::query_usize(request, "max_txs"),
         api.config.rest_default_max_address_summary_txs,
@@ -263,9 +264,9 @@ fn txs_summary(
     json(&summaries, TTL_SHORT)
 }
 
-fn utxo(api: &RestApi, key: ScriptKey) -> Result<HttpResponse> {
+fn utxo(api: &RestApi, key: ScriptKey, deadline: &Deadline) -> Result<HttpResponse> {
     let scripthash = key.electrum()?;
-    let history = api.server.chain().script_history(scripthash)?;
+    let history = api.server.chain().script_history(scripthash, deadline)?;
     if history.peak_live_utxos > api.config.utxos_limit {
         return Err(HttpError::bad_request(format!(
             "Too many UTXOs: {} exceeds the limit of {}",
@@ -354,7 +355,7 @@ struct Histories {
 }
 
 impl Histories {
-    fn load(api: &RestApi, keys: &[ScriptKey]) -> Result<Self> {
+    fn load(api: &RestApi, keys: &[ScriptKey], deadline: &Deadline) -> Result<Self> {
         let mut entries = Vec::with_capacity(keys.len());
         let mut seen = BTreeSet::new();
         for key in keys {
@@ -362,7 +363,10 @@ impl Histories {
             if !seen.insert(scripthash) {
                 continue;
             }
-            entries.push((scripthash, api.server.chain().script_history(scripthash)?));
+            entries.push((
+                scripthash,
+                api.server.chain().script_history(scripthash, deadline)?,
+            ));
         }
         Ok(Self { entries })
     }
@@ -451,9 +455,15 @@ fn mempool_stats(api: &RestApi, scripthash: ElectrumScripthash, history: &Script
     stats
 }
 
-fn tx_values(api: &RestApi, txids: &[Txid], limit: usize) -> Result<Vec<TransactionValue>> {
+fn tx_values(
+    api: &RestApi,
+    txids: &[Txid],
+    limit: usize,
+    deadline: &Deadline,
+) -> Result<Vec<TransactionValue>> {
     let mut out = Vec::new();
     for txid in txids.iter().take(limit) {
+        query::check_deadline(deadline)?;
         if let Some(value) = query::tx_value_opt(api, txid)? {
             out.push(value);
         }

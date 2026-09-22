@@ -8,7 +8,7 @@ use bitcoin::{hashes::Hash, Network};
 use bitcoin::{BlockHash, Txid};
 use log::*;
 
-use crate::{client, db, fmt, headers, index, Location};
+use crate::{client, db, fmt, headers, index, Location, TxBytesRef};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -434,6 +434,20 @@ impl IndexedChain {
         Ok(self
             .client
             .get_block_part(location.indexed_header.hash(), pos)?)
+    }
+
+    /// Resolve a location to the byte range holding its transaction, fetching
+    /// nothing. Callers that hold a lock over the chain can collect these,
+    /// release the lock, and fetch the bodies themselves.
+    pub fn tx_bytes_ref(&self, location: &Location) -> Result<TxBytesRef, Error> {
+        let pos = self.store.get_tx_block_pos(location.txnum)?;
+        Ok(TxBytesRef {
+            block_hash: location.indexed_header.hash(),
+            block_height: location.block_height(),
+            block_position: location.block_position(),
+            offset: pos.offset,
+            size: pos.size,
+        })
     }
 
     /// Return the active-chain transaction ids in block order for a height.

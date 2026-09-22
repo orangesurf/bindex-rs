@@ -72,6 +72,19 @@ impl CoreRest {
         self.get_bytes(&format!("/rest/headers/1/{hash}.bin"))
     }
 
+    /// A byte range of a block (`/rest/blockpart`, the endpoint bindex fetches
+    /// every transaction body through).
+    pub fn block_part(
+        &self,
+        hash: &bitcoin::BlockHash,
+        offset: u32,
+        size: u32,
+    ) -> Result<Vec<u8>, Error> {
+        self.get_bytes(&format!(
+            "/rest/blockpart/{hash}.bin?offset={offset}&size={size}"
+        ))
+    }
+
     /// Raw transaction bytes. Without `-txindex` this only answers for
     /// transactions in the mempool, which is exactly what the REST API needs it
     /// for (confirmed bodies come from the index).

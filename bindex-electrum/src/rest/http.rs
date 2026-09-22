@@ -9,9 +9,10 @@ use std::{collections::HashMap, io};
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-/// Largest request body accepted before the connection is dropped. A 25-element
-/// package of 400 kB transactions is the biggest legitimate body.
-pub const MAX_BODY: usize = 32 << 20;
+/// Largest request body accepted unless `--request-body-bytes-cap` says
+/// otherwise: 25 transactions of 800 000 hex characters plus JSON framing,
+/// which is the biggest legitimate body (`POST /txs/package`).
+pub const MAX_BODY: usize = 20_000_200;
 
 const MAX_LINE: usize = 64 << 10;
 const MAX_HEADERS: usize = 100;
@@ -39,73 +40,106 @@ impl HttpRequest {
     }
 }
 
-/// Read one request. `Ok(None)` means the peer closed the connection cleanly.
-pub async fn read_request<R>(reader: &mut R) -> io::Result<Option<HttpRequest>>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let Some(request_line) = read_line(reader).await? else {
-        return Ok(None);
-    };
-    if request_line.trim().is_empty() {
-        // tolerate a stray CRLF between pipelined requests
-        let Some(next) = read_line(reader).await? else {
-            return Ok(None);
-        };
-        return parse_request(next, reader).await;
-    }
-    parse_request(request_line, reader).await
+/// What reading one request produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOutcome {
+    Request(Box<HttpRequest>),
+    /// The peer closed the connection.
+    Closed,
+    /// The request cannot be framed. The server answers with this status and
+    /// closes: leaving the connection open would mean guessing where the next
+    /// request starts, which is how request smuggling works.
+    Invalid { status: u16, message: &'static str },
 }
 
-async fn parse_request<R>(request_line: String, reader: &mut R) -> io::Result<Option<HttpRequest>>
+fn invalid(status: u16, message: &'static str) -> io::Result<ReadOutcome> {
+    Ok(ReadOutcome::Invalid { status, message })
+}
+
+/// Read one request.
+pub async fn read_request<R>(reader: &mut R, max_body: usize) -> io::Result<ReadOutcome>
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut parts = request_line.trim_end().split(' ');
-    let method = parts.next().unwrap_or_default().to_string();
-    let target = parts.next().unwrap_or_default().to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
-    if method.is_empty() || target.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed request line"));
+    let mut request_line = match read_line(reader).await? {
+        Line::Eof => return Ok(ReadOutcome::Closed),
+        Line::TooLong => return invalid(400, "request line too long"),
+        Line::Read(line) => line,
+    };
+    // tolerate a stray CRLF left over from a previous request
+    if request_line.trim().is_empty() {
+        request_line = match read_line(reader).await? {
+            Line::Eof => return Ok(ReadOutcome::Closed),
+            Line::TooLong => return invalid(400, "request line too long"),
+            Line::Read(line) => line,
+        };
     }
 
-    let mut headers = HashMap::new();
-    for _ in 0..MAX_HEADERS {
-        let Some(line) = read_line(reader).await? else {
-            break;
+    let parts: Vec<&str> = request_line.trim_end().split(' ').collect();
+    let (method, target, version) = match parts.as_slice() {
+        [method, target, version] => (*method, *target, *version),
+        [method, target] => (*method, *target, "HTTP/1.1"),
+        _ => return invalid(400, "malformed request line"),
+    };
+    if method.is_empty()
+        || target.is_empty()
+        || !method.bytes().all(|b| b.is_ascii_alphabetic())
+        || !version.starts_with("HTTP/")
+    {
+        return invalid(400, "malformed request line");
+    }
+    let (method, target, version) = (method.to_string(), target.to_string(), version.to_string());
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    loop {
+        if headers.len() >= MAX_HEADERS {
+            return invalid(400, "too many request headers");
+        }
+        let line = match read_line(reader).await? {
+            Line::Eof => return Ok(ReadOutcome::Closed),
+            Line::TooLong => return invalid(400, "request header too long"),
+            Line::Read(line) => line,
         };
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        let Some((name, value)) = line.split_once(':') else {
+            return invalid(400, "malformed request header");
+        };
+        // an obs-fold continuation line, or a space before the colon
+        if name.is_empty() || name.chars().any(char::is_whitespace) {
+            return invalid(400, "malformed request header");
+        }
+        headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+    }
+
+    // No framing but Content-Length is supported, and a request that claims
+    // another one must be refused rather than framed by guesswork.
+    if headers.iter().any(|(name, _)| name == "transfer-encoding") {
+        return invalid(501, "transfer-encoding is not supported");
+    }
+    let content_length = match content_length(&headers) {
+        Ok(length) => length,
+        Err(message) => return invalid(400, message),
+    };
+    if content_length > max_body {
+        return invalid(400, "request body too large");
+    }
+
+    // grown while reading, never pre-allocated from the claimed length
+    let mut body = Vec::new();
+    if content_length > 0 {
+        let read = reader
+            .take(content_length as u64)
+            .read_to_end(&mut body)
+            .await?;
+        if read != content_length {
+            return Ok(ReadOutcome::Closed);
         }
     }
 
-    if headers
-        .get("transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "chunked request bodies are not supported",
-        ));
-    }
-
-    let content_length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    if content_length > MAX_BODY {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "request body too large"));
-    }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body).await?;
-    }
-
-    let keep_alive = match headers.get("connection").map(|v| v.to_ascii_lowercase()) {
+    let keep_alive = match connection_header(&headers) {
         Some(value) if value.contains("close") => false,
         Some(value) if value.contains("keep-alive") => true,
         _ => version != "HTTP/1.0",
@@ -116,27 +150,68 @@ where
         None => (target.as_str(), None),
     };
 
-    Ok(Some(HttpRequest {
+    Ok(ReadOutcome::Request(Box::new(HttpRequest {
         method,
         path: percent_decode(raw_path),
         raw_target: raw_path.to_string(),
         query: raw_query.map(parse_query).unwrap_or_default(),
         body,
         keep_alive,
-    }))
+    })))
 }
 
-async fn read_line<R>(reader: &mut R) -> io::Result<Option<String>>
+/// The body length, refusing everything ambiguous: an unparseable or negative
+/// value, a list whose members disagree, or two headers that disagree.
+fn content_length(headers: &[(String, String)]) -> Result<usize, &'static str> {
+    let mut length: Option<usize> = None;
+    for (_, raw) in headers.iter().filter(|(name, _)| name == "content-length") {
+        for field in raw.split(',') {
+            let field = field.trim();
+            let Ok(value) = field.parse::<usize>() else {
+                return Err("invalid Content-Length");
+            };
+            // a leading sign or padding parses nowhere else, but be explicit
+            if !field.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("invalid Content-Length");
+            }
+            match length {
+                Some(seen) if seen != value => return Err("conflicting Content-Length"),
+                _ => length = Some(value),
+            }
+        }
+    }
+    Ok(length.unwrap_or(0))
+}
+
+fn connection_header(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name == "connection")
+        .map(|(_, value)| value.to_ascii_lowercase())
+}
+
+enum Line {
+    Read(String),
+    TooLong,
+    Eof,
+}
+
+async fn read_line<R>(reader: &mut R) -> io::Result<Line>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut buf = Vec::new();
-    let mut limited = reader.take(MAX_LINE as u64);
-    let read = limited.read_until(b'\n', &mut buf).await?;
+    let read = reader
+        .take(MAX_LINE as u64)
+        .read_until(b'\n', &mut buf)
+        .await?;
     if read == 0 {
-        return Ok(None);
+        return Ok(Line::Eof);
     }
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    if !buf.ends_with(b"\n") {
+        return Ok(Line::TooLong);
+    }
+    Ok(Line::Read(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
@@ -218,8 +293,12 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        408 => "Request Timeout",
         422 => "Unprocessable Entity",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Unknown",
     }
 }
@@ -274,9 +353,23 @@ mod tests {
     use super::*;
     use tokio::io::BufReader;
 
-    async fn parse(raw: &str) -> HttpRequest {
+    async fn read(raw: &str) -> ReadOutcome {
         let mut reader = BufReader::new(raw.as_bytes());
-        read_request(&mut reader).await.unwrap().unwrap()
+        read_request(&mut reader, MAX_BODY).await.unwrap()
+    }
+
+    async fn parse(raw: &str) -> HttpRequest {
+        match read(raw).await {
+            ReadOutcome::Request(request) => *request,
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    async fn rejected(raw: &str) -> (u16, &'static str) {
+        match read(raw).await {
+            ReadOutcome::Invalid { status, message } => (status, message),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -309,8 +402,115 @@ mod tests {
 
     #[tokio::test]
     async fn empty_stream_ends_the_connection() {
-        let mut reader = BufReader::new(&b""[..]);
-        assert!(read_request(&mut reader).await.unwrap().is_none());
+        assert_eq!(read("").await, ReadOutcome::Closed);
+    }
+
+    #[tokio::test]
+    async fn malformed_request_lines_are_rejected() {
+        assert_eq!(rejected("nonsense\r\n\r\n").await.0, 400);
+        assert_eq!(rejected("GET\r\n\r\n").await.0, 400);
+        assert_eq!(rejected("GET / SPDY/1.0\r\n\r\n").await.0, 400);
+        assert_eq!(rejected("G3T / HTTP/1.1\r\n\r\n").await.0, 400);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_content_length_is_rejected() {
+        // would otherwise be read as zero, leaving the body to be framed as the
+        // next pipelined request
+        for header in ["x2", "-5", "+4", "0x4", "", "4a"] {
+            let raw = format!("POST /tx HTTP/1.1\r\nContent-Length: {header}\r\n\r\nGET / HTTP/1.1\r\n\r\n");
+            assert_eq!(rejected(&raw).await, (400, "invalid Content-Length"), "{header:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_content_lengths_are_rejected() {
+        let listed = "POST /tx HTTP/1.1\r\nContent-Length: 5, 6\r\n\r\nhello";
+        assert_eq!(rejected(listed).await, (400, "conflicting Content-Length"));
+        let duplicated =
+            "POST /tx HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
+        assert_eq!(rejected(duplicated).await, (400, "conflicting Content-Length"));
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_content_lengths_are_accepted() {
+        let request = parse("POST /tx HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\nhello").await;
+        assert_eq!(request.body, b"hello");
+        let request =
+            parse("POST /tx HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello").await;
+        assert_eq!(request.body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn transfer_encoding_is_refused_outright() {
+        let chunked = "POST /tx HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        assert_eq!(rejected(chunked).await, (501, "transfer-encoding is not supported"));
+        let smuggled =
+            "POST /tx HTTP/1.1\r\nContent-Length: 6\r\nTransfer-Encoding: identity\r\n\r\nhello!";
+        assert_eq!(rejected(smuggled).await.0, 501);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_rejected() {
+        let mut reader = BufReader::new(&b"POST /tx HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world"[..]);
+        let outcome = read_request(&mut reader, 10).await.unwrap();
+        assert!(
+            matches!(outcome, ReadOutcome::Invalid { status: 400, message } if message == "request body too large"),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_body_closes_instead_of_reserving_it() {
+        // the claimed length is never pre-allocated, so a client can declare a
+        // huge body and send nothing without costing the server that memory
+        let raw = "POST /tx HTTP/1.1\r\nContent-Length: 10000000\r\n\r\nabc";
+        assert_eq!(read(raw).await, ReadOutcome::Closed);
+    }
+
+    #[tokio::test]
+    async fn too_many_headers_are_rejected() {
+        let mut raw = String::from("GET / HTTP/1.1\r\n");
+        for i in 0..MAX_HEADERS + 1 {
+            raw.push_str(&format!("X-Pad-{i}: 1\r\n"));
+        }
+        raw.push_str("\r\n");
+        assert_eq!(rejected(&raw).await, (400, "too many request headers"));
+    }
+
+    #[tokio::test]
+    async fn an_overlong_request_line_is_rejected() {
+        let raw = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(MAX_LINE));
+        assert_eq!(rejected(&raw).await, (400, "request line too long"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_header_is_rejected() {
+        assert_eq!(
+            rejected("GET / HTTP/1.1\r\nnot a header\r\n\r\n").await,
+            (400, "malformed request header")
+        );
+        assert_eq!(
+            rejected("GET / HTTP/1.1\r\nContent-Length : 0\r\n\r\n").await,
+            (400, "malformed request header")
+        );
+    }
+
+    #[tokio::test]
+    async fn pipelined_requests_are_framed_by_content_length() {
+        let raw = "POST /tx HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /blocks/tip/height HTTP/1.1\r\n\r\n";
+        let mut reader = BufReader::new(raw.as_bytes());
+        let first = read_request(&mut reader, MAX_BODY).await.unwrap();
+        let ReadOutcome::Request(first) = first else {
+            panic!("expected a request, got {first:?}");
+        };
+        assert_eq!(first.body, b"hello");
+        let second = read_request(&mut reader, MAX_BODY).await.unwrap();
+        let ReadOutcome::Request(second) = second else {
+            panic!("expected a request, got {second:?}");
+        };
+        assert_eq!(second.path, "/blocks/tip/height");
+        assert!(second.body.is_empty());
     }
 
     #[tokio::test]
@@ -331,5 +531,12 @@ mod tests {
         assert!(text.contains("X-Bitcoin-Version: /Satoshi:30.0.0/\r\n"));
         assert!(text.contains("Cache-Control: public, max-age=10\r\n"));
         assert!(text.ends_with("\r\n\r\nhi"));
+    }
+
+    #[tokio::test]
+    async fn rejection_statuses_have_reason_phrases() {
+        for status in [400, 408, 501, 503, 504] {
+            assert_ne!(reason(status), "Unknown", "{status}");
+        }
     }
 }
