@@ -36,8 +36,8 @@ and error texts follow `mempool/electrs`; see `bindex-electrum/src/rest/`.
 
 Notes specific to this backend:
 
-* Only in the Bitcoin build. The module is compiled out with `--features liquid`,
-  whose transactions are Elements-encoded, and `--http-addr` is rejected there.
+* The Liquid build (`--features liquid`) serves the electrs-liquid shapes from
+  the same routes; see "The REST API on Liquid" below.
 * A REST scripthash is `sha256(scriptPubKey)` **as given** — unlike the Electrum
   protocol's reversed form.
 * Bodies that the index does not store come from bitcoind's REST interface,
@@ -80,3 +80,39 @@ Notes specific to this backend:
 * Running a second instance against a live index needs `--secondary-path` (and
   its own `--monitor-path`/`--cache-path`): a RocksDB secondary directory cannot
   be shared between processes.
+
+### The REST API on Liquid
+
+With `--features liquid`, `--http-addr` serves what electrs-liquid (liquid.network)
+serves, and `--network` names the parent chain (`bitcoin` for Liquid). The
+transaction, block and outspend JSON matches liquid.network byte for byte on the
+fixtures in `bindex-electrum/tests/fixtures/liquid/` (a coinbase, a confidential
+transaction, an issuance, a reissuance, a peg-in and a peg-out):
+
+* Outputs carry `value`/`asset` when explicit and `valuecommitment`/`assetcommitment`
+  when blinded, never both; the explicit fee output is typed `fee`; a peg-out gets
+  a `pegout` object with its Bitcoin address. Inputs carry `is_pegin` and, when they
+  issue, an `issuance` object. A peg-in has no `prevout`.
+* `fee` is what the explicit fee outputs pay in L-BTC. `sigops` is counted as
+  electrs counts it (legacy only for a coinbase or any peg-in).
+* `/block/:hash` includes the header's `ext` (dynafed parameters and signblock
+  witness); the list routes leave it out. There are no `nonce`, `bits` or
+  `difficulty` fields and no `/tx/:txid/merkleblock-proof`.
+* Address stats carry counts only (no sums), summaries a zero `value`, and each
+  `/utxo` entry the output's commitments and nonce, which costs one transaction
+  fetch per UTXO. `/mempool/recent` entries have no `value`. Where the deployed
+  liquid.network differs from the electrs source, liquid.network wins: stats are
+  ordered `funded_txo_count, spent_txo_count, tx_count`, and UTXOs carry no
+  surjection or range proofs.
+* Prevouts come from the funding transactions: from the same block when possible,
+  otherwise one index lookup per funding transaction. The facade's `spenttxouts`
+  cannot be used for this: its Bitcoin encoding has no room for commitments.
+* Block metadata, mempool bodies and the mempool list come from Elements RPC
+  (`getblock <hash> 1`, `getrawtransaction`, `getrawmempool true`), because the
+  REST facade serves only what the indexer needs. A prevout the index does not
+  have (a pruned-region stub) falls back to `getrawtransaction`, which answers
+  only when the node runs with `-txindex`.
+* `/asset*` and `/assets*` need an asset index that does not exist here. With
+  `--asset-upstream https://liquid.network/api` they are forwarded there, status,
+  body and the registry's `X-Total-Results` included; without it they answer 404.
+
