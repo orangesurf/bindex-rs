@@ -299,9 +299,9 @@ pub fn header_time(raw_header: &[u8]) -> Result<u32, String> {
     Ok(header.time)
 }
 
-/// What liquid.network serves for a UTXO. The mempool/electrs source also
-/// emits `surjection_proof` and `range_proof` (about 4 KB per entry); the
-/// deployed reference does not, and nothing here reads them.
+/// A UTXO as the reference serves it. Its source declares `surjection_proof`
+/// and `range_proof` too, but it stores outputs without their witness, so
+/// they are always empty and skipped; liquid.network never shows them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UtxoValue {
     pub txid: String,
@@ -343,8 +343,8 @@ impl UtxoValue {
     }
 }
 
-/// Liquid address stats carry counts only, in the order liquid.network
-/// serves them (the mempool/electrs source puts `tx_count` first).
+/// Liquid address stats carry counts only. The reference passes them through
+/// `json!`, which sorts keys, so the fields are declared alphabetically.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ScriptStats {
     pub funded_txo_count: usize,

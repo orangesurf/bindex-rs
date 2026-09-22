@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bitcoin::{BlockHash, OutPoint, Txid};
+#[cfg(not(feature = "liquid"))]
 use serde::Serialize;
 
 use crate::{
@@ -37,6 +38,7 @@ const MULTI_ADDRESS_LIMIT: usize = 300;
 /// Body bytes accepted by the same routes.
 const MULTI_ADDRESS_BODY_LIMIT: usize = 21600;
 
+#[cfg(not(feature = "liquid"))]
 #[derive(Debug, Serialize)]
 struct AddressStats {
     address: String,
@@ -44,6 +46,7 @@ struct AddressStats {
     mempool_stats: ScriptStats,
 }
 
+#[cfg(not(feature = "liquid"))]
 #[derive(Debug, Serialize)]
 struct ScripthashStats {
     scripthash: String,
@@ -143,6 +146,23 @@ fn stats(api: &RestApi, key: ScriptKey, deadline: &Deadline) -> Result<HttpRespo
         history.spent_txo_sum,
     );
     let mempool_stats = mempool_stats(api, scripthash, &history);
+    // The reference builds this object with `json!`, whose map sorts its keys,
+    // so it goes out alphabetically: `scripthash` last, `tx_count` last inside
+    // each stats object. The Bitcoin shapes below predate that finding and
+    // still put the label and `tx_count` first.
+    #[cfg(feature = "liquid")]
+    {
+        let (label, value) = key.label();
+        json(
+            &serde_json::json!({
+                label: value,
+                "chain_stats": chain_stats,
+                "mempool_stats": mempool_stats,
+            }),
+            TTL_SHORT,
+        )
+    }
+    #[cfg(not(feature = "liquid"))]
     match key {
         ScriptKey::Address(address, _) => json(
             &AddressStats {

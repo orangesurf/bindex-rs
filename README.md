@@ -100,10 +100,10 @@ transaction, an issuance, a reissuance, a peg-in and a peg-out):
   `difficulty` fields and no `/tx/:txid/merkleblock-proof`.
 * Address stats carry counts only (no sums), summaries a zero `value`, and each
   `/utxo` entry the output's commitments and nonce, which costs one transaction
-  fetch per UTXO. `/mempool/recent` entries have no `value`. Where the deployed
-  liquid.network differs from the electrs source, liquid.network wins: stats are
-  ordered `funded_txo_count, spent_txo_count, tx_count`, and UTXOs carry no
-  surjection or range proofs.
+  fetch per UTXO. `/mempool/recent` entries have no `value`. The stats object goes
+  out with its keys sorted (`scripthash` last, `tx_count` last), because electrs
+  builds it with `json!`; UTXOs carry no surjection or range proofs, because
+  electrs stores outputs without their witness.
 * Prevouts come from the funding transactions: from the same block when possible,
   otherwise one index lookup per funding transaction. The facade's `spenttxouts`
   cannot be used for this: its Bitcoin encoding has no room for commitments.

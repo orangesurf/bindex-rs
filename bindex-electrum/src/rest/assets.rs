@@ -16,13 +16,20 @@ use crate::rest::{
 
 /// How long one upstream request may take.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long one connect attempt may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Largest upstream body relayed (the registry list is paged at 100 entries).
 const UPSTREAM_BODY_LIMIT: u64 = 16 << 20;
 
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
+        // IPv4 only: ureq tries the resolved addresses one after another, IPv6
+        // first, with no happy eyeballs. Where IPv6 connects hang instead of
+        // failing, that cost ~6 s per address, ~30 s before the first IPv4 try.
         ureq::Agent::config_builder()
+            .ip_family(ureq::config::IpFamily::Ipv4Only)
+            .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(UPSTREAM_TIMEOUT))
             .http_status_as_error(false)
             .user_agent(format!("bindex-electrum/{}", env!("CARGO_PKG_VERSION")))
