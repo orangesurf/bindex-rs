@@ -18,6 +18,10 @@ pub enum Error {
 
     #[error("bitcoind REST response decode failed: {0}")]
     Decode(String),
+
+    #[cfg(feature = "liquid")]
+    #[error("node RPC request failed: {0}")]
+    Rpc(String),
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +52,9 @@ impl CoreRest {
         self
     }
 
-    /// One RPC call, with "not found" (-5, -8) mapped to `NotFound`.
+    /// One RPC call, with "not found" (-5, -8) mapped to `NotFound`, and so is
+    /// a pruned block (-1 "Block not available (pruned data)"), as Core's REST
+    /// interface answers 404 for one.
     #[cfg(feature = "liquid")]
     fn rpc(&self, method: &str, params: Value) -> Result<Option<Value>, Error> {
         let Some(rpc) = &self.rpc else {
@@ -56,11 +62,15 @@ impl CoreRest {
         };
         match rpc.call_sync(method, params) {
             Ok(Ok(value)) => Ok(Some(value)),
-            Ok(Err(err)) => match err.get("code").and_then(Value::as_i64) {
-                Some(-5 | -8) => Err(Error::NotFound),
-                _ => Err(Error::Transport(format!("{method}: {err}"))),
-            },
-            Err(err) => Err(Error::Transport(err.to_string())),
+            Ok(Err(err)) => {
+                let message = err.get("message").and_then(Value::as_str).unwrap_or("");
+                match err.get("code").and_then(Value::as_i64) {
+                    Some(-5 | -8) => Err(Error::NotFound),
+                    Some(-1) if message.contains("pruned") => Err(Error::NotFound),
+                    _ => Err(Error::Rpc(format!("{method}: {err}"))),
+                }
+            }
+            Err(err) => Err(Error::Rpc(format!("{method}: {err}"))),
         }
     }
 

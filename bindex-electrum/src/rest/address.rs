@@ -394,9 +394,11 @@ fn utxo_value(
     status: TransactionStatus,
     _value: u64,
 ) -> Result<Option<UtxoValue>> {
+    // the history listed it, so its funding transaction must be there too
     let Some(txout) = query::prevout(api, &outpoint)? else {
-        log::warn!("utxo {outpoint} has no funding transaction");
-        return Ok(None);
+        return Err(HttpError::server_error(format!(
+            "utxo {outpoint} has no funding transaction"
+        )));
     };
     Ok(Some(UtxoValue::new(outpoint, status, &txout)))
 }

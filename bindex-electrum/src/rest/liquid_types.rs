@@ -36,6 +36,9 @@ impl PegoutValue {
     /// Only an explicit L-BTC output naming the parent chain counts as a
     /// peg-out; any other OP_RETURN of the same form is just data.
     fn from_txout(txout: &TxOut, params: Params) -> Option<Self> {
+        if !params.pegouts {
+            return None;
+        }
         let pegout = txout.pegout_data()?;
         if pegout.asset != Asset::Explicit(params.policy_asset)
             || pegout.genesis_hash != params.parent_genesis
@@ -625,6 +628,23 @@ mod tests {
             let value = TransactionValue::new(&tx, &prevouts, status, params);
             assert_eq!(serde_json::to_string(&value).unwrap(), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn pegouts_show_only_on_liquid_itself() {
+        let fixture: Json = serde_json::from_str(FIXTURES[5].1).unwrap();
+        let raw = hex::decode(fixture["hex"].as_str().unwrap()).unwrap();
+        let tx = format::decode_tx(&raw).unwrap();
+        let pegouts = |network| {
+            let params = format::params(network).unwrap();
+            tx.output
+                .iter()
+                .filter(|txout| TxOutValue::new(txout, params).pegout.is_some())
+                .count()
+        };
+        assert_eq!(pegouts(bitcoin::Network::Bitcoin), 1);
+        // electrs has no pegged asset off mainnet
+        assert_eq!(pegouts(bitcoin::Network::Regtest), 0);
     }
 
     #[test]

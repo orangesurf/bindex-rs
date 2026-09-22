@@ -98,6 +98,9 @@ mod imp {
         pub parent_genesis: bitcoin::BlockHash,
         /// The asset fees are paid in (L-BTC on Liquid).
         pub policy_asset: AssetId,
+        /// Whether outputs can be peg-outs. electrs knows a pegged asset only
+        /// for Liquid itself, so it shows `pegout` nowhere else.
+        pub pegouts: bool,
     }
 
     /// `--network` names the parent chain, as it does for the index directory:
@@ -124,6 +127,7 @@ mod imp {
             parent: network,
             parent_genesis: bitcoin::constants::genesis_block(network).block_hash(),
             policy_asset: policy_asset.parse().expect("valid asset id"),
+            pegouts: network == bitcoin::Network::Bitcoin,
         })
     }
 

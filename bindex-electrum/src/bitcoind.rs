@@ -104,6 +104,8 @@ impl RpcClient {
             .post(&self.url)
             .config()
             .http_status_as_error(false)
+            // a stalled node must not pin a worker past any request deadline
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
             .build()
             .header("Content-Type", "application/json");
         if let Some((user, password)) = self.credentials()? {
@@ -116,7 +118,8 @@ impl RpcClient {
         if response.status() == 401 {
             return Err(Error::Auth("node refused the RPC credentials".to_string()));
         }
-        let response: Value = response.body_mut().with_config().limit(1 << 30).read_json()?;
+        // getrawmempool true on a full mempool is tens of MB
+        let response: Value = response.body_mut().with_config().limit(256 << 20).read_json()?;
         if let Some(err) = response.get("error").filter(|value| !value.is_null()) {
             return Ok(Err(err.clone()));
         }
