@@ -175,7 +175,7 @@ impl Server {
     /// Only started when the REST API is enabled: the Electrum methods work
     /// without it (they answer from the chain index), while every REST route
     /// that mentions unconfirmed transactions needs it.
-    pub(crate) fn spawn_mempool_poll_task(&self) {
+    pub fn spawn_mempool_poll_task(&self) {
         if self.state.config.rest.http_addr.is_none() {
             return;
         }

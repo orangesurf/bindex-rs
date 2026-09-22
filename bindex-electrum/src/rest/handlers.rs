@@ -244,7 +244,7 @@ fn block_txid_at(api: &RestApi, hash: &str, index: &str) -> Result<HttpResponse>
 
 fn block_txs(api: &RestApi, hash: &str, start: Option<&str>) -> Result<HttpResponse> {
     let hash = query::parse_block_hash(hash)?;
-    let page = api.config.rest_default_chain_txs_per_page;
+    let page = api.config.rest_default_chain_txs_per_page.max(1);
     let start = start.map(query::parse_usize).transpose()?.unwrap_or(0);
     let (status, tx_count, in_best_chain, height) = block_context(api, &hash)?;
 

@@ -384,7 +384,7 @@ impl Histories {
             }
         }
         let mut rows: Vec<MergedRow> = merged.into_values().collect();
-        rows.sort_by(|a, b| (b.height, b.position).cmp(&(a.height, a.position)));
+        rows.sort_by_key(|row| std::cmp::Reverse((row.height, row.position)));
         rows
     }
 
