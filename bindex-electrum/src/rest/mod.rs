@@ -10,6 +10,7 @@
 //! transactions are Elements-encoded and need a different set of shapes.
 #![cfg(not(feature = "liquid"))]
 
+pub mod address;
 pub mod handlers;
 pub mod http;
 pub mod query;

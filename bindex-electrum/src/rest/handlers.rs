@@ -7,6 +7,7 @@ use crate::{
     merkle,
     protocol::ElectrumScripthash,
     rest::{
+        address,
         http::{HttpRequest, HttpResponse},
         json,
         query::{self, FoundTx},
@@ -106,13 +107,30 @@ fn route_blocking(
         }
         ("POST", ["internal", "mempool", "txs"]) => internal_mempool_txs_batch(api, request),
 
+        ("GET", [prefix @ ("address" | "scripthash"), value, rest @ ..]) => {
+            address::get_route(api, request, script_key(api, prefix, value)?, rest)
+        }
+        ("POST", [prefix @ ("addresses" | "scripthashes"), rest @ ..]) => {
+            address::post_route(api, request, prefix, rest)
+        }
+        ("GET", ["address-prefix"]) | ("GET", ["address-prefix", _]) => {
+            address::address_prefix(api)
+        }
+
         _ => Err(unrouted(request)),
     }
 }
 
 /// The reference's fallthrough: no 405, a wrong method is just an unknown path.
-fn unrouted(request: &HttpRequest) -> HttpError {
+pub(crate) fn unrouted(request: &HttpRequest) -> HttpError {
     HttpError::not_found(format!("endpoint does not exist {:?}", request.raw_target))
+}
+
+fn script_key(api: &RestApi, prefix: &str, value: &str) -> Result<query::ScriptKey> {
+    match prefix {
+        "address" => query::address_key(value, api.network),
+        _ => query::scripthash_key(value),
+    }
 }
 
 // ---------------------------------------------------------------- blocks
