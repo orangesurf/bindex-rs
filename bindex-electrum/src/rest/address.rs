@@ -75,11 +75,21 @@ pub fn post_route(
     prefix: &str,
     rest: &[&str],
 ) -> Result<HttpResponse> {
-    let keys = multi_keys(api, request, prefix)?;
+    // route before reading the body: an unknown subpath is a 404, not a
+    // complaint about what was posted to it
     match rest {
-        ["txs"] => txs(api, request, &keys),
-        ["txs", "summary"] => txs_summary(api, request, &keys, None),
-        ["txs", "summary", cursor] => txs_summary(api, request, &keys, Some(cursor)),
+        ["txs"] => {
+            let keys = multi_keys(api, request, prefix)?;
+            txs(api, request, &keys)
+        }
+        ["txs", "summary"] => {
+            let keys = multi_keys(api, request, prefix)?;
+            txs_summary(api, request, &keys, None)
+        }
+        ["txs", "summary", cursor] => {
+            let keys = multi_keys(api, request, prefix)?;
+            txs_summary(api, request, &keys, Some(cursor))
+        }
         _ => Err(crate::rest::handlers::unrouted(request)),
     }
 }

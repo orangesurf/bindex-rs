@@ -670,6 +670,14 @@ async fn broadcast(api: &RestApi, raw_tx_hex: &str) -> Result<HttpResponse> {
 }
 
 async fn txs_test(api: &RestApi, request: &Req<'_>) -> Result<HttpResponse> {
+    // With --broadcast-via tor nothing may reach the local node: handing it the
+    // client's hex would leak exactly what the tor path exists to hide, and
+    // mempool.space's onion has no testmempoolaccept endpoint to forward to.
+    if api.server.config().broadcast_via == crate::config::BroadcastVia::Tor {
+        return Err(HttpError::bad_request(
+            "testmempoolaccept is unavailable with --broadcast-via tor",
+        ));
+    }
     let txs = submitted_txs(request)?;
     let maxfeerate = amount_param(request, "maxfeerate")?;
     check_tx_hex(&txs)?;
