@@ -51,7 +51,30 @@ Notes specific to this backend:
 * `/tx/:txid/outspend*` has no index behind it — the `spending` column family is
   never written — so the spender is found by scanning the funding script's index
   rows from the funding block on. That is cheap for a normal address and
-  proportional to reuse for a hot one.
+  proportional to reuse for a hot one. `POST /internal/txs/outspends/by-txid`
+  keeps the reference's "no limit" on the batch, so it pays that cost once per
+  output of every transaction posted to it: it is bounded only by the
+  per-request deadline and the query semaphore below, and a batch of hot
+  transactions will hit the deadline rather than finish.
+* A query never holds the chain lock while it waits on the node. The index work
+  (the scripthash scan, and resolving each row to a byte range) runs under the
+  read lock; the bodies are fetched with it released, eight at a time, and the
+  tip is re-read afterwards so a fold never mixes two views of the chain. This
+  matters because the secondary refresh needs the write lock: a query that held
+  the read lock for a minute would stall the refresh and every other reader
+  behind it.
+* Bounds, all configurable: `--rest-request-timeout-secs` (30) gives up with a
+  504, `--rest-max-concurrent-queries` (4) sheds the expensive routes with a
+  503 rather than letting them crowd out the cheap ones,
+  `--rest-max-connections` (100) answers 503 instead of dropping, and
+  `--rest-header-timeout-secs` (10) / `--rest-idle-timeout-secs` (30) close
+  connections that never finish a request. Request bodies stop at
+  `--request-body-bytes-cap` (20,000,200). Only `Content-Length` framing is
+  accepted: anything ambiguous, and any `Transfer-Encoding`, is refused and the
+  connection closed.
+* `POST /txs/test` is refused under `--broadcast-via tor`: forwarding the
+  client's hex to the local node is what that mode exists to prevent, and
+  mempool.space's onion has no `testmempoolaccept` endpoint to forward to.
 * `/address-prefix/:prefix` cannot be served: the index stores an 8-byte prefix
   of each scripthash and no addresses.
 * Running a second instance against a live index needs `--secondary-path` (and
