@@ -12,8 +12,8 @@ use crate::{
         query::{self, FoundTx},
         text,
         types::{
-            merkleblock_hex, BlockStatus, BlockValue, MerkleProof, SpendingValue,
-            TransactionStatus,
+            merkleblock_hex, BlockStatus, BlockValue, MempoolInfo, MerkleProof, SpendingValue,
+            TransactionStatus, TransactionValue,
         },
         ttl_by_depth, HttpError, RestApi, Result, TTL_LONG, TTL_SHORT,
     },
@@ -91,6 +91,20 @@ fn route_blocking(
         ("POST", ["internal", "txs", "outspends", "by-outpoint"]) => {
             internal_outspends_by_outpoint(api, request)
         }
+
+        ("GET", ["mempool"]) => mempool(api),
+        ("GET", ["mempool", "txids"]) => mempool_txids(api),
+        ("GET", ["mempool", "txids", "page"]) => mempool_txids_page(api, request, None),
+        ("GET", ["mempool", "txids", "page", cursor]) => {
+            mempool_txids_page(api, request, Some(cursor))
+        }
+        ("GET", ["mempool", "recent"]) => mempool_recent(api),
+        ("GET", ["internal", "mempool", "txs", "all"]) => internal_mempool_txs_all(api),
+        ("GET", ["internal", "mempool", "txs"]) => internal_mempool_txs(api, request, None),
+        ("GET", ["internal", "mempool", "txs", cursor]) => {
+            internal_mempool_txs(api, request, Some(cursor))
+        }
+        ("POST", ["internal", "mempool", "txs"]) => internal_mempool_txs_batch(api, request),
 
         _ => Err(unrouted(request)),
     }
@@ -729,4 +743,116 @@ fn protocol_error_text(err: crate::protocol::Error) -> String {
             .to_string(),
         other => other.to_string(),
     }
+}
+
+// ---------------------------------------------------------------- mempool
+
+fn mempool(api: &RestApi) -> Result<HttpResponse> {
+    let mempool = api.server.mempool().read().expect("mempool lock");
+    let (count, vsize, total_fee) = mempool.totals();
+    json(
+        &MempoolInfo {
+            count,
+            vsize,
+            total_fee,
+            fee_histogram: mempool.fee_histogram_bins(),
+        },
+        TTL_SHORT,
+    )
+}
+
+fn mempool_txids(api: &RestApi) -> Result<HttpResponse> {
+    let txids = sorted_mempool_txids(api);
+    let txids: Vec<String> = txids.iter().map(ToString::to_string).collect();
+    json(&txids, TTL_SHORT)
+}
+
+fn mempool_txids_page(
+    api: &RestApi,
+    request: &HttpRequest,
+    cursor: Option<&str>,
+) -> Result<HttpResponse> {
+    let limit = api.config.capped_max_txs(
+        query::query_usize(request, "max_txs"),
+        api.config.rest_max_mempool_txid_page_size,
+        api.config.rest_max_mempool_txid_page_size,
+    );
+    let page = paged_txids(api, cursor, limit)?;
+    let page: Vec<String> = page.iter().map(ToString::to_string).collect();
+    json(&page, TTL_SHORT)
+}
+
+fn mempool_recent(api: &RestApi) -> Result<HttpResponse> {
+    let recent = api.server.mempool().read().expect("mempool lock").recent();
+    json(&recent, crate::rest::TTL_MEMPOOL_RECENT)
+}
+
+fn internal_mempool_txs(
+    api: &RestApi,
+    request: &HttpRequest,
+    cursor: Option<&str>,
+) -> Result<HttpResponse> {
+    let limit = api.config.capped_max_txs(
+        query::query_usize(request, "max_txs"),
+        api.config.rest_max_mempool_page_size,
+        api.config.rest_max_mempool_page_size,
+    );
+    let page = paged_txids(api, cursor, limit)?;
+    json(&mempool_tx_values(api, &page)?, TTL_SHORT)
+}
+
+fn internal_mempool_txs_all(api: &RestApi) -> Result<HttpResponse> {
+    let txids = sorted_mempool_txids(api);
+    json(&mempool_tx_values(api, &txids)?, TTL_SHORT)
+}
+
+fn internal_mempool_txs_batch(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let requested = txid_body(request)?;
+    let known: Vec<Txid> = {
+        let mempool = api.server.mempool().read().expect("mempool lock");
+        requested
+            .into_iter()
+            .filter(|txid| mempool.contains(txid))
+            .collect()
+    };
+    json(&mempool_tx_values(api, &known)?, 0)
+}
+
+fn sorted_mempool_txids(api: &RestApi) -> Vec<Txid> {
+    api.server
+        .mempool()
+        .read()
+        .expect("mempool lock")
+        .sorted_txids()
+}
+
+/// One page of mempool txids in `Txid` order; the cursor names the last txid
+/// of the previous page.
+fn paged_txids(api: &RestApi, cursor: Option<&str>, limit: usize) -> Result<Vec<Txid>> {
+    let txids = sorted_mempool_txids(api);
+    let start = match cursor {
+        Some(cursor) => {
+            let cursor = query::parse_txid(cursor)?;
+            match txids.binary_search(&cursor) {
+                Ok(index) => index + 1,
+                Err(index) => index,
+            }
+        }
+        None => 0,
+    };
+    Ok(txids
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .collect())
+}
+
+fn mempool_tx_values(api: &RestApi, txids: &[Txid]) -> Result<Vec<TransactionValue>> {
+    let mut out = Vec::with_capacity(txids.len());
+    for txid in txids {
+        if let Some(value) = query::tx_value_opt(api, txid)? {
+            out.push(value);
+        }
+    }
+    Ok(out)
 }
