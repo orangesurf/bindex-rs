@@ -22,6 +22,19 @@ use crate::{
 /// `GET /txs/outspends?txids=` accepts at most this many.
 const MAX_BATCH_TXIDS: usize = 50;
 
+/// `POST /txs/test` and `POST /txs/package` accept at most this many.
+const MAX_SUBMIT_TXS: usize = 25;
+
+/// Hex-string length bounds the reference applies to each submitted transaction.
+const MIN_TX_HEX: usize = 120;
+const MAX_TX_HEX: usize = 800_000;
+
+/// Confirmation targets `/fee-estimates` reports on.
+const CONF_TARGETS: &[usize] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 144,
+    504, 1008,
+];
+
 /// Dispatch one request.
 ///
 /// Everything but broadcasting is blocking (index reads and bitcoind round
@@ -29,6 +42,15 @@ const MAX_BATCH_TXIDS: usize = 50;
 /// multi-threaded runtime, which is what `main` and the tests use.
 pub async fn route(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
     let segments = request.segments();
+    // the routes that talk to bitcoind (or to the onion push endpoint) are async
+    match (request.method.as_str(), segments.as_slice()) {
+        ("POST", ["tx"]) => return post_tx(api, request).await,
+        ("GET", ["broadcast"]) => return get_broadcast(api, request).await,
+        ("POST", ["txs", "test"]) => return txs_test(api, request).await,
+        ("POST", ["txs", "package"]) => return txs_package(api, request).await,
+        ("GET", ["fee-estimates"]) => return fee_estimates(api).await,
+        _ => {}
+    }
     tokio::task::block_in_place(|| route_blocking(api, request, &segments))
 }
 
@@ -542,5 +564,169 @@ fn outspends_or_empty(api: &RestApi, txid: &str) -> Result<Vec<SpendingValue>> {
     match query::find_tx(api, &txid)? {
         Some(found) => outspends_of(api, &txid, &found.tx),
         None => Ok(Vec::new()),
+    }
+}
+
+// ---------------------------------------------------------------- broadcast
+
+/// `POST /tx` takes the raw hex as the body, not as JSON.
+async fn post_tx(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let raw = String::from_utf8(request.body.clone())
+        .map_err(|err| HttpError::bad_request(err.to_string()))?;
+    broadcast(api, raw.trim()).await
+}
+
+async fn get_broadcast(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let raw = request
+        .param("tx")
+        .ok_or_else(|| HttpError::bad_request("Missing tx"))?
+        .to_string();
+    broadcast(api, raw.trim()).await
+}
+
+/// Honours `--broadcast-via`: with `tor` this is the same fresh-circuit push
+/// the Electrum `blockchain.transaction.broadcast` method makes, and nothing is
+/// submitted to the local node.
+async fn broadcast(api: &RestApi, raw_tx_hex: &str) -> Result<HttpResponse> {
+    let value = api
+        .server
+        .broadcast(raw_tx_hex)
+        .await
+        .map_err(|err| HttpError::bad_request(protocol_error_text(err)))?;
+    let txid = value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string());
+    Ok(HttpResponse::text(200, txid, Some(0)))
+}
+
+async fn txs_test(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let txs = submitted_txs(request)?;
+    let maxfeerate = amount_param(request, "maxfeerate")?;
+    check_tx_hex(&txs)?;
+    let params = match maxfeerate {
+        Some(maxfeerate) => serde_json::json!([txs, maxfeerate]),
+        None => serde_json::json!([txs]),
+    };
+    let result = api
+        .server
+        .bitcoind()
+        .call("testmempoolaccept", params)
+        .await
+        .map_err(|err| rpc_error("testmempoolaccept", err))?;
+    json(&result, TTL_SHORT)
+}
+
+async fn txs_package(api: &RestApi, request: &HttpRequest) -> Result<HttpResponse> {
+    let txs = submitted_txs(request)?;
+    let maxfeerate = amount_param(request, "maxfeerate")?;
+    let maxburnamount = amount_param(request, "maxburnamount")?;
+    check_tx_hex(&txs)?;
+
+    // with --broadcast-via tor the package goes to the onion package endpoint
+    // on its own circuit, exactly as blockchain.transaction.broadcast_package
+    // does; maxfeerate/maxburnamount have nowhere to go on that path
+    if api.server.config().broadcast_via == crate::config::BroadcastVia::Tor {
+        let result = api
+            .server
+            .broadcast_package(&txs)
+            .await
+            .map_err(|err| HttpError::bad_request(protocol_error_text(err)))?;
+        return json(&result, TTL_SHORT);
+    }
+
+    let params = match (maxfeerate, maxburnamount) {
+        (None, None) => serde_json::json!([txs]),
+        (Some(feerate), None) => serde_json::json!([txs, feerate]),
+        (feerate, Some(burn)) => serde_json::json!([
+            txs,
+            feerate.unwrap_or_else(|| "0.10000000".to_string()),
+            burn
+        ]),
+    };
+    let result = api
+        .server
+        .bitcoind()
+        .call("submitpackage", params)
+        .await
+        .map_err(|err| rpc_error("submitpackage", err))?;
+    json(&result, TTL_SHORT)
+}
+
+async fn fee_estimates(api: &RestApi) -> Result<HttpResponse> {
+    if let Some(cached) = api.fee_estimates_cached() {
+        return json(&cached, TTL_SHORT);
+    }
+    let mut estimates = serde_json::Map::new();
+    for target in CONF_TARGETS {
+        match api.server.bitcoind().estimate_fee(*target).await {
+            // bitcoind reports BTC/kvB; Esplora reports sat/vB
+            Ok(feerate) if feerate > 0.0 => {
+                let sat_per_vb = feerate * 100_000_000.0 / 1000.0;
+                estimates.insert(
+                    target.to_string(),
+                    serde_json::Number::from_f64(sat_per_vb)
+                        .map(Value::Number)
+                        .unwrap_or(Value::Null),
+                );
+            }
+            Ok(_) => {}
+            Err(err) => return Err(rpc_error("estimatesmartfee", err)),
+        }
+    }
+    let value = Value::Object(estimates);
+    api.store_fee_estimates(value.clone());
+    json(&value, TTL_SHORT)
+}
+
+/// The count check comes first, then the parameters, then the per-item checks.
+fn submitted_txs(request: &HttpRequest) -> Result<Vec<String>> {
+    let txs: Vec<String> = serde_json::from_slice(&request.body)
+        .map_err(|err| HttpError::bad_request(err.to_string()))?;
+    if txs.len() > MAX_SUBMIT_TXS {
+        return Err(HttpError::bad_request(format!(
+            "Exceeded maximum of {MAX_SUBMIT_TXS} transactions"
+        )));
+    }
+    Ok(txs)
+}
+
+fn check_tx_hex(txs: &[String]) -> Result<()> {
+    for (index, tx) in txs.iter().enumerate() {
+        if tx.len() < MIN_TX_HEX || tx.len() > MAX_TX_HEX || hex::decode(tx).is_err() {
+            return Err(HttpError::bad_request(format!(
+                "Invalid transaction size/hex for item {index}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A BTC amount query parameter, forwarded to bitcoind with eight decimals.
+fn amount_param(request: &HttpRequest, name: &str) -> Result<Option<String>> {
+    let Some(raw) = request.param(name) else {
+        return Ok(None);
+    };
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| HttpError::bad_request(format!("Invalid {name}")))?;
+    Ok(Some(format!("{value:.8}")))
+}
+
+fn rpc_error(method: &str, err: crate::bitcoind::Error) -> HttpError {
+    let detail = match err {
+        crate::bitcoind::Error::Rpc(message) => message,
+        other => other.to_string(),
+    };
+    HttpError::bad_request(format!("{method} RPC error: {detail}"))
+}
+
+fn protocol_error_text(err: crate::protocol::Error) -> String {
+    match err {
+        crate::protocol::Error::Server(message) => message
+            .strip_prefix("bitcoind RPC error: ")
+            .unwrap_or(&message)
+            .to_string(),
+        other => other.to_string(),
     }
 }
