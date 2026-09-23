@@ -7,6 +7,58 @@ See [slides](https://docs.google.com/presentation/d/1Zez-6DApKRu59kke4i_g9jwxQla
 
 Bitcoin Core 31 is required for efficient indexing and querying.
 
+## What this fork adds
+
+This fork turns bindex from an indexing library into a set of servers you can
+point wallets and block explorers at, for Bitcoin and for Liquid. All credit for
+the index itself goes to [Roman Zeyde](https://github.com/romanz): the compact
+scripthash and txid index, and the Core REST fetching it relies on, are his.
+Everything below sits on top of that, on branch `main`; `master` tracks upstream.
+
+Upstream ships the library and `bindex-cli`. The fork adds three programs:
+
+| Program | What it does |
+|---|---|
+| `bindex-electrum` | Electrum protocol server, plus an optional Esplora REST API |
+| `bindex-web` | Owns and syncs the index, and serves an address and txid search page |
+| `bindex-sync` | A minimal writer that only keeps the index synced, for pairing with read-only servers |
+
+The main features:
+
+* **Electrum server:** headers, scripthash history, balance, UTXOs, mempool and
+  subscriptions, transaction and merkle-proof lookups, fee estimates and
+  histograms, JSON-RPC batching, TCP and TLS, and a result cache.
+* **Package broadcast:** `blockchain.transaction.broadcast_package` submits a
+  package of related transactions, as Bitcoin Core's `submitpackage` does.
+* **Tor broadcast:** with `--broadcast-via tor`, every transaction and package
+  goes to mempool.space's onion endpoint on a fresh Tor circuit, and nothing is
+  ever submitted through your own node. The trade-off is a dependency on that
+  endpoint; `--broadcast-via bitcoind` uses your node instead.
+* **Esplora REST API:** `--http-addr` serves the mempool/electrs REST surface
+  (blocks, transactions, outspends, the mempool, address and scripthash routes,
+  the `/internal` batch routes and broadcast) with the reference's shapes, TTLs
+  and error texts. The trade-off is that it keeps no extra indexes: to show
+  which transaction spent an output, it walks the history of the address that
+  received it. That is instant for a typical address and takes seconds for one
+  with thousands of transactions; see the section below for the costs and bounds.
+* **Liquid:** `--features liquid` indexes a Liquid (Elements) chain and serves
+  both the Electrum protocol and the electrs-liquid REST shapes: commitments,
+  peg-ins, peg-outs and issuances. Six real Liquid transactions are test
+  fixtures, and the REST output matches liquid.network's byte for byte on them.
+  Asset pages (issuance history, supply, names and tickers) need an index of
+  every asset, which the fork does not build; `--asset-upstream` forwards those
+  requests to another Esplora server, such as liquid.network.
+* **Read-only secondaries:** a server can open the index as a RocksDB secondary
+  while a separate writer syncs it. A refresh reads only the new header rows, so
+  following a 4-million-block Liquid chain costs milliseconds rather than the
+  ~0.9 s a full reload took; a reorg below the tip still reloads the chain.
+* **Connection reuse:** the REST client reuses HTTP connections, which stops
+  long syncs running out of ephemeral ports.
+
+Every feature has tests: `cargo test -p bindex-electrum` runs unit tests and
+regtest end-to-end suites against a local `bitcoind`, and the Liquid build's
+tests run with `--features liquid`. None of this has been reviewed upstream.
+
 ## Usage
 
 [![asciicast](https://asciinema.org/a/yFjcbagORZNMtoOPikw0kUlC9.svg)](https://asciinema.org/a/yFjcbagORZNMtoOPikw0kUlC9)
