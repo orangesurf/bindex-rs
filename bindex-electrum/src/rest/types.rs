@@ -409,9 +409,23 @@ fn inner_scripts(txin: &TxIn, prevout: Option<&TxOut>) -> (Option<String>, Optio
         (Some(redeem.to_asm_string()), witness_asm)
     } else if prev_script.is_p2wsh() {
         (None, last_witness_script_asm(txin))
+    } else if prev_script.is_p2tr() {
+        (None, taproot_script_asm(txin))
     } else {
         (None, None)
     }
+}
+
+/// The script of a taproot script-path spend: second from last in the
+/// witness, third when the last element is an annex (BIP341: at least two
+/// elements, the last starting 0x50). A key-path spend (one element) has none.
+#[cfg(not(feature = "liquid"))]
+fn taproot_script_asm(txin: &TxIn) -> Option<String> {
+    let len = txin.witness.len();
+    let last = txin.witness.last()?;
+    let from_last = if len >= 2 && last.first() == Some(&0x50) { 3 } else { 2 };
+    let script = txin.witness.nth(len.checked_sub(from_last)?)?;
+    Some(Script::from_bytes(script).to_asm_string())
 }
 
 #[cfg(not(feature = "liquid"))]
@@ -593,6 +607,32 @@ mod tests {
                 .unwrap_or_else(|| panic!("{field} missing or out of order in {json}"));
             cursor += at + field.len();
         }
+    }
+
+    #[test]
+    fn taproot_script_path_spends_show_their_script() {
+        let prevout = TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: script(
+                "5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+            ),
+        };
+        let tapscript = hex::decode("20a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684cac").unwrap();
+        let control = vec![0xc0; 33];
+        let spend = |items: Vec<Vec<u8>>| TxIn {
+            witness: bitcoin::Witness::from_slice(&items),
+            ..Default::default()
+        };
+        let expected = Script::from_bytes(&tapscript).to_asm_string();
+        // signature, script, control block
+        let plain = spend(vec![vec![1; 64], tapscript.clone(), control.clone()]);
+        assert_eq!(inner_scripts(&plain, Some(&prevout)).1.as_deref(), Some(expected.as_str()));
+        // the same with an annex after the control block
+        let annexed = spend(vec![vec![1; 64], tapscript.clone(), control, vec![0x50, 1]]);
+        assert_eq!(inner_scripts(&annexed, Some(&prevout)).1.as_deref(), Some(expected.as_str()));
+        // a key-path spend has no script
+        let key_path = spend(vec![vec![1; 64]]);
+        assert_eq!(inner_scripts(&key_path, Some(&prevout)), (None, None));
     }
 
     #[test]

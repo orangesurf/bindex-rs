@@ -12,8 +12,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bitcoin::{BlockHash, OutPoint, Txid};
-#[cfg(not(feature = "liquid"))]
-use serde::Serialize;
 
 use crate::{
     chain::{ScriptHistory, ScriptUtxo},
@@ -37,22 +35,6 @@ const MAX_HISTORY_TXS: usize = 100;
 const MULTI_ADDRESS_LIMIT: usize = 300;
 /// Body bytes accepted by the same routes.
 const MULTI_ADDRESS_BODY_LIMIT: usize = 21600;
-
-#[cfg(not(feature = "liquid"))]
-#[derive(Debug, Serialize)]
-struct AddressStats {
-    address: String,
-    chain_stats: ScriptStats,
-    mempool_stats: ScriptStats,
-}
-
-#[cfg(not(feature = "liquid"))]
-#[derive(Debug, Serialize)]
-struct ScripthashStats {
-    scripthash: String,
-    chain_stats: ScriptStats,
-    mempool_stats: ScriptStats,
-}
 
 /// `GET /address/:addr/…` and `GET /scripthash/:hash/…`.
 pub fn get_route(
@@ -103,15 +85,15 @@ pub fn post_route(
 /// `GET /address-prefix/:prefix`.
 ///
 /// bindex stores an 8-byte prefix of each scripthash and no addresses at all,
-/// so there is nothing to enumerate: the route answers as the reference does
-/// when address search is switched off.
+/// so there is nothing to enumerate. By default the route answers as the
+/// reference does when address search is switched off (400); with
+/// `--address-search` it answers "no matches", which an explorer's search box
+/// takes in its stride where a 400 would surface as an error.
 pub fn address_prefix(api: &RestApi) -> Result<HttpResponse> {
     if !api.config.address_search {
         return Err(HttpError::bad_request("address search disabled"));
     }
-    Err(HttpError::bad_request(
-        "address search is not supported by this backend",
-    ))
+    json(&Vec::<String>::new(), TTL_SHORT)
 }
 
 fn multi_keys(api: &RestApi, request: &Req<'_>, prefix: &str) -> Result<Vec<ScriptKey>> {
@@ -147,40 +129,17 @@ fn stats(api: &RestApi, key: ScriptKey, deadline: &Deadline) -> Result<HttpRespo
     );
     let mempool_stats = mempool_stats(api, scripthash, &history);
     // The reference builds this object with `json!`, whose map sorts its keys,
-    // so it goes out alphabetically: `scripthash` last, `tx_count` last inside
-    // each stats object. The Bitcoin shapes below predate that finding and
-    // still put the label and `tx_count` first.
-    #[cfg(feature = "liquid")]
-    {
-        let (label, value) = key.label();
-        json(
-            &serde_json::json!({
-                label: value,
-                "chain_stats": chain_stats,
-                "mempool_stats": mempool_stats,
-            }),
-            TTL_SHORT,
-        )
-    }
-    #[cfg(not(feature = "liquid"))]
-    match key {
-        ScriptKey::Address(address, _) => json(
-            &AddressStats {
-                address,
-                chain_stats,
-                mempool_stats,
-            },
-            TTL_SHORT,
-        ),
-        ScriptKey::Scripthash(scripthash) => json(
-            &ScripthashStats {
-                scripthash,
-                chain_stats,
-                mempool_stats,
-            },
-            TTL_SHORT,
-        ),
-    }
+    // so it goes out alphabetically: `address` first, `scripthash` last, and
+    // `tx_count` last inside each stats object.
+    let (label, value) = key.label();
+    json(
+        &serde_json::json!({
+            label: value,
+            "chain_stats": chain_stats,
+            "mempool_stats": mempool_stats,
+        }),
+        TTL_SHORT,
+    )
 }
 
 fn txs(api: &RestApi, request: &Req<'_>, keys: &[ScriptKey]) -> Result<HttpResponse> {

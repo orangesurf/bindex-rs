@@ -146,7 +146,8 @@ pub struct RestConfig {
     #[arg(long)]
     pub cors: bool,
 
-    /// Enable `GET /address-prefix/:prefix` (unsupported by this backend).
+    /// Answer `GET /address-prefix/:prefix` with an empty list instead of 400
+    /// (the index holds no addresses to search).
     #[arg(long)]
     pub address_search: bool,
 

@@ -76,7 +76,13 @@ Notes specific to this backend:
   client's hex to the local node is what that mode exists to prevent, and
   mempool.space's onion has no `testmempoolaccept` endpoint to forward to.
 * `/address-prefix/:prefix` cannot be served: the index stores an 8-byte prefix
-  of each scripthash and no addresses.
+  of each scripthash and no addresses. It answers 400 "address search disabled"
+  by default and an empty list with `--address-search`, which an explorer's
+  search box handles as "no suggestions".
+* The address/scripthash stats object goes out with its keys sorted (the label
+  first or last, `tx_count` last), because electrs builds it with `json!`.
+* Mempool `vsize` (in `/mempool`, the fee histogram and `/mempool/recent`) is
+  `weight / 4` rounded down, as electrs computes it, not the node's figure.
 * Running a second instance against a live index needs `--secondary-path` (and
   its own `--monitor-path`/`--cache-path`): a RocksDB secondary directory cannot
   be shared between processes.
@@ -100,10 +106,8 @@ transaction, an issuance, a reissuance, a peg-in and a peg-out):
   `difficulty` fields and no `/tx/:txid/merkleblock-proof`.
 * Address stats carry counts only (no sums), summaries a zero `value`, and each
   `/utxo` entry the output's commitments and nonce, which costs one transaction
-  fetch per UTXO. `/mempool/recent` entries have no `value`. The stats object goes
-  out with its keys sorted (`scripthash` last, `tx_count` last), because electrs
-  builds it with `json!`; UTXOs carry no surjection or range proofs, because
-  electrs stores outputs without their witness.
+  fetch per UTXO. `/mempool/recent` entries have no `value`. UTXOs carry no surjection
+  or range proofs, because electrs stores outputs without their witness.
 * Prevouts come from the funding transactions: from the same block when possible,
   otherwise one index lookup per funding transaction. The facade's `spenttxouts`
   cannot be used for this: its Bitcoin encoding has no room for commitments.

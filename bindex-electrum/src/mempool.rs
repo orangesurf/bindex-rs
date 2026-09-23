@@ -313,7 +313,10 @@ pub fn build_tx(
         txid: parsed.txid,
         raw,
         fee: info.fee,
-        vsize: info.vsize,
+        // weight / 4, rounded down, as electrs computes it for /mempool, the
+        // fee histogram and /mempool/recent; the node's own vsize rounds up
+        // (and on Bitcoin Core also counts sigops)
+        vsize: parsed.weight / 4,
         ancestor_fees: info.ancestor_fees,
         ancestor_vsize: info.ancestor_vsize,
         time: info.time,
