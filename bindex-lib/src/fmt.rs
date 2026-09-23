@@ -54,6 +54,8 @@ pub struct ParsedTx {
     /// Previous outputs spent on *this* chain (coinbase and peg-in inputs are omitted).
     pub inputs: Vec<OutPoint>,
     pub outputs: Vec<TxOutView>,
+    /// Weight units, as the format defines them.
+    pub weight: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +159,7 @@ mod imp {
                     value: o.value.to_sat(),
                 })
                 .collect(),
+            weight: tx.weight().to_wu(),
         })
     }
 
@@ -239,6 +242,7 @@ mod imp {
                     value: o.value.explicit().unwrap_or(0),
                 })
                 .collect(),
+            weight: tx.weight() as u64,
         })
     }
 

@@ -306,6 +306,27 @@ impl DB {
         self.db.get_cf(self.cf(HEADERS_CF), key)
     }
 
+    /// Load the header rows from `key` (inclusive) onwards; `first_height` is
+    /// the height of the row at `key`.
+    pub fn headers_from(
+        &self,
+        key: &[u8],
+        first_height: usize,
+    ) -> Result<Vec<index::IndexedHeader>, rocksdb::Error> {
+        let cf = self.cf(HEADERS_CF);
+        let mode = rocksdb::IteratorMode::From(key, rocksdb::Direction::Forward);
+        let mut result = Vec::new();
+        for (offset, kv) in self.db.iterator_cf(cf, mode).enumerate() {
+            let (key, value) = kv?;
+            result.push(index::IndexedHeader::deserialize(
+                &key[..],
+                &value[..],
+                first_height + offset,
+            ));
+        }
+        Ok(result)
+    }
+
     /// Load all headers from DB.
     pub fn headers(&self) -> Result<Vec<index::IndexedHeader>, rocksdb::Error> {
         let cf = self.cf(HEADERS_CF);

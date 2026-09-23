@@ -275,8 +275,26 @@ impl IndexedChain {
         })
     }
 
+    /// Follow the primary. Usually that only appended blocks, so the rows
+    /// from our tip onwards are read and added (a Liquid chain has 4M headers,
+    /// and reloading them all took ~0.9 s under the chain's write lock on every
+    /// refresh). If our tip row changed or vanished, the primary reorged, and
+    /// the whole chain is reloaded.
     pub fn refresh_secondary(&mut self) -> Result<(), Error> {
         self.store.catch_up_with_primary()?;
+        if let Some(tip) = self.headers.tip().cloned() {
+            let rows = self.store.headers_from(&tip.key(), tip.height() as usize)?;
+            let extends_tip = rows.first().map(index::IndexedHeader::hash) == Some(tip.hash())
+                && rows
+                    .windows(2)
+                    .all(|pair| pair[1].prev_blockhash() == pair[0].hash());
+            if extends_tip {
+                for row in rows.into_iter().skip(1) {
+                    self.headers.add(row);
+                }
+                return Ok(());
+            }
+        }
         self.headers = headers::Headers::new(self.store.headers()?);
         Ok(())
     }
