@@ -1,174 +1,144 @@
-# Bitcoin indexing library in Rust
+# bindex
 
-[![CI](https://github.com/romanz/bindex-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/romanz/bindex-rs/actions)
-[![crates.io](https://img.shields.io/crates/v/bindex.svg)](https://crates.io/crates/bindex)
+bindex is a compact address and transaction index for Bitcoin and Liquid, with
+the servers that wallets and block explorers connect to. One index serves four
+uses: a command-line address watcher, an Electrum server, an Esplora REST API and
+a search page. On Bitcoin mainnet the index takes about 57 GB (September 2026).
 
-See [slides](https://docs.google.com/presentation/d/1Zez-6DApKRu59kke4i_g9jwxQlaFKKRpOPdYFYsFXfA/) for more details.
+This repository is a fork of Roman Zeyde's
+[romanz/bindex-rs](https://github.com/romanz/bindex-rs). The index design is his;
+see his [slides](https://docs.google.com/presentation/d/1Zez-6DApKRu59kke4i_g9jwxQlaFKKRpOPdYFYsFXfA/)
+for how it works. Features marked ![new][new] were added in this fork and are not in
+upstream. Everything else is upstream's.
 
-Bitcoin Core 31 is required for efficient indexing and querying.
+## How the index works
 
-## What this fork adds
+For every confirmed transaction, bindex stores an 8-byte prefix of its txid and of
+each script it touches, mapped to a 4-byte transaction number. It stores no
+transaction bodies, amounts or addresses. When a query needs a transaction, bindex
+reads just that transaction's bytes from Bitcoin Core's REST interface, using the
+block position it recorded.
 
-This fork turns bindex from an indexing library into a set of servers you can
-point wallets and block explorers at, for Bitcoin and for Liquid. All credit for
-the index itself goes to [Roman Zeyde](https://github.com/romanz): the compact
-scripthash and txid index, and the Core REST fetching it relies on, are his.
-Everything below sits on top of that, on branch `main`; `master` tracks upstream.
+That is why the index is small. The trade-off is that every answer involves the
+node: bodies come from Core, and a short prefix can match the wrong script, so
+each candidate is fetched and checked. Bitcoin Core 31 or later is required, with
+`rest=1`, for the REST endpoints bindex reads.
 
-Upstream ships the library and `bindex-cli`. The fork adds three programs:
+## Index library (`bindex-lib`)
 
-| Program | What it does |
-|---|---|
-| `bindex-electrum` | Electrum protocol server, plus an optional Esplora REST API |
-| `bindex-web` | Owns and syncs the index, and serves an address and txid search page |
-| `bindex-sync` | A minimal writer that only keeps the index synced, for pairing with read-only servers |
+- **Sync from Bitcoin Core:** fetches headers, blocks and spent outputs over REST
+  in binary format, follows reorgs, and compacts the database when idle.
+- **Lookups:** transaction locations by script hash or txid, raw transaction
+  bytes, and the header chain.
+- **Address cache:** an SQLite cache holding the history and transactions of a
+  set of watched addresses, kept in step with the index.
+- **Custom REST URL:** the node's REST server does not have to be on localhost.
+- **Read-only followers:** ![new][new] a second process can open the index
+  as a RocksDB secondary while one writer syncs it. A refresh reads only the new
+  header rows, so following Liquid's 4-million-block chain costs milliseconds
+  rather than about 0.9 s. A reorg below the tip still reloads the chain.
+- **Named index directories:** ![new][new] several indexes, such as Bitcoin
+  and Liquid, can share one data directory.
+- **Liquid format:** ![new][new] with `--features liquid`, the library reads
+  Elements blocks, including variable-length dynafed headers. The on-disk layout
+  is unchanged.
+- **Connection reuse:** ![new][new] REST calls reuse HTTP connections, which
+  stops long syncs running out of ephemeral ports.
 
-The main features:
+## Address watcher (`bindex-cli`)
 
-* **Electrum server:** headers, scripthash history, balance, UTXOs, mempool and
-  subscriptions, transaction and merkle-proof lookups, fee estimates and
-  histograms, JSON-RPC batching, TCP and TLS, and a result cache.
-* **Package broadcast:** `blockchain.transaction.broadcast_package` submits a
-  package of related transactions, as Bitcoin Core's `submitpackage` does.
-* **Tor broadcast:** with `--broadcast-via tor`, every transaction and package
-  goes to mempool.space's onion endpoint on a fresh Tor circuit, and nothing is
-  ever submitted through your own node. The trade-off is a dependency on that
-  endpoint; `--broadcast-via bitcoind` uses your node instead.
-* **Esplora REST API:** `--http-addr` serves the mempool/electrs REST surface
-  (blocks, transactions, outspends, the mempool, address and scripthash routes,
-  the `/internal` batch routes and broadcast) with the reference's shapes, TTLs
-  and error texts. The trade-off is that it keeps no extra indexes: to show
-  which transaction spent an output, it walks the history of the address that
-  received it. That is instant for a typical address and takes seconds for one
-  with thousands of transactions; see the section below for the costs and bounds.
-* **Liquid:** `--features liquid` indexes a Liquid (Elements) chain and serves
-  both the Electrum protocol and the electrs-liquid REST shapes: commitments,
-  peg-ins, peg-outs and issuances. Six real Liquid transactions are test
-  fixtures, and the REST output matches liquid.network's byte for byte on them.
-  Asset pages (issuance history, supply, names and tickers) need an index of
-  every asset, which the fork does not build; `--asset-upstream` forwards those
-  requests to another Esplora server, such as liquid.network.
-* **Read-only secondaries:** a server can open the index as a RocksDB secondary
-  while a separate writer syncs it. A refresh reads only the new header rows, so
-  following a 4-million-block Liquid chain costs milliseconds rather than the
-  ~0.9 s a full reload took; a reorg below the tip still reloads the chain.
-* **Connection reuse:** the REST client reuses HTTP connections, which stops
-  long syncs running out of ephemeral ports.
+- **Watch a list of addresses:** reads addresses from a file or standard input,
+  syncs the index and prints each address's history with a running balance.
+- **Persistent cache:** `--cache` keeps that history in an SQLite file between
+  runs; `contrib/history.sql` queries it directly.
+- **One-shot mode:** `--sync-once` exits after catching up.
+- **All networks:** mainnet, testnet, testnet4, signet and regtest.
 
-Every feature has tests: `cargo test -p bindex-electrum` runs unit tests and
-regtest end-to-end suites against a local `bitcoind`, and the Liquid build's
-tests run with `--features liquid`. None of this has been reviewed upstream.
+## Index writer (`bindex-sync`) ![new][new]
 
-## Usage
+- **Writer only:** ![new][new] keeps an index synced and serves nothing, so
+  servers can follow it as read-only secondaries.
+- **Any Core-compatible REST source:** ![new][new] a node, or a facade in
+  front of one.
+- **Catch-up mode:** ![new][new] `--once` exits when no new blocks arrive.
 
-[![asciicast](https://asciinema.org/a/yFjcbagORZNMtoOPikw0kUlC9.svg)](https://asciinema.org/a/yFjcbagORZNMtoOPikw0kUlC9)
+## Electrum server (`bindex-electrum`) ![new][new]
 
-## Liquid (Elements) support
+- **Protocol 1.4 to 1.6:** ![new][new] negotiated per connection, including
+  1.6's header arrays, `mempool.get_info` and canonical mempool ordering.
+- **Full method set:** ![new][new] headers with checkpoint proofs, script-hash
+  history, balance, UTXOs and mempool, subscriptions, transaction and Merkle-proof
+  lookups, fee estimates and fee histograms.
+- **Package broadcast:** ![new][new] `blockchain.transaction.broadcast_package`
+  submits related transactions together, as Core's `submitpackage` does.
+- **Tor broadcast:** ![new][new] by default on Bitcoin, every transaction goes
+  to mempool.space's onion endpoint on a fresh Tor circuit, and nothing is
+  submitted through your node. That needs a running Tor daemon and depends on
+  mempool.space; `--broadcast-via bitcoind` uses your node instead.
+- **Transports:** ![new][new] TCP and TLS, JSON-RPC batching, and per-session
+  limits on batch size and subscriptions.
+- **History cache and monitor:** ![new][new] script histories and statuses are
+  cached in SQLite, and request latencies are written to a JSON file for the
+  monitor page.
+
+The server follows the index as a read-only secondary, so it needs a writer:
+`bindex-sync` or `bindex-web`. It polls the node's mempool every 5 seconds.
+
+## Esplora REST API (`bindex-electrum --http-addr`) ![new][new]
+
+- **The mempool/electrs REST API:** ![new][new] blocks, transactions,
+  outspends, the mempool, fee estimates, address and script-hash routes, the
+  `/internal` batch routes and broadcast, with the reference's response shapes,
+  cache lifetimes and error texts.
+- **Liquid responses:** ![new][new] the Liquid build serves electrs-liquid's
+  shapes (commitments, peg-ins, peg-outs, issuances). On six real Liquid
+  transactions kept as test fixtures, the output matches liquid.network byte for
+  byte.
+- **Asset forwarding:** ![new][new] `--asset-upstream` forwards asset routes
+  to another Esplora server, since the fork builds no asset index.
+- **Bounded cost:** ![new][new] request deadlines, a cap on concurrent
+  expensive queries and a connection limit, all configurable.
+
+The API adds no indexes of its own. To find which transaction spent an output, it
+walks the history of the script that received it. That's instant for a typical
+address and takes seconds for one with thousands of transactions.
+[docs/esplora-rest-api.md](docs/esplora-rest-api.md) covers the costs, the bounds
+and every known difference from the reference.
+
+## Search page (`bindex-web`) ![new][new]
+
+- **Address and transaction search:** ![new][new] a page showing an address's
+  history or a transaction's summary, served from the index.
+- **Monitor page:** ![new][new] request counts, errors and latencies per route,
+  for itself and for `bindex-electrum`.
+- **Owns the index:** ![new][new] it syncs the index as the primary writer.
+
+Its settings (mainnet, `./db`, a loopback listen address) are constants in
+`bindex-web/src/main.rs`; it has no command-line options yet.
+
+## Liquid ![new][new]
 
 `bindex-lib`, `bindex-sync` and `bindex-electrum` build with `--features liquid` to
-index a Liquid/Elements chain. The only format-aware code is `bindex-lib/src/fmt.rs`
-(rust-bitcoin by default, rust-elements behind the feature); hashes are exposed as
-`bitcoin::BlockHash`/`bitcoin::Txid` everywhere else and the on-disk layout is
-unchanged (header rows carry the raw header bytes, which are 80 bytes on Bitcoin and
-variable-length dynafed headers on Liquid). Elements exposes no `spenttxouts` or
-`blockpart` REST endpoints, so indexing Liquid needs a facade that serves the
-full REST surface from batched RPC. Build Liquid binaries into their own target dir so
-the Bitcoin binaries under `target/release` (used by running services) stay put:
+index a Liquid chain and serve both Electrum and the Liquid REST API from it.
+Elements has no `spenttxouts` or `blockpart` REST endpoints, so indexing Liquid
+needs a REST facade in front of the node. This repository doesn't include one.
 
+## Build and run
+
+    cargo build --release -p bindex-sync -p bindex-electrum -p bindex-web -p bindex-cli
     cargo build --release --target-dir target-liquid -p bindex-sync -p bindex-electrum \
         --features "bindex-sync/liquid bindex-electrum/liquid"
 
-## Esplora-compatible REST API
+A minimal Bitcoin setup is a writer plus a server over the same data directory:
 
-`bindex-electrum --http-addr 127.0.0.1:3000` serves the mempool/electrs REST
-surface (`/blocks`, `/block`, `/tx`, `/address`, `/scripthash`, `/mempool`,
-`/fee-estimates`, the `/internal` batches and the broadcast routes) beside the
-Electrum listener, from the same chain and mempool state. Response shapes, TTLs
-and error texts follow `mempool/electrs`; see `bindex-electrum/src/rest/`.
+    target/release/bindex-sync --db-path ./db --rest-url http://127.0.0.1:8332
+    target/release/bindex-electrum --bindex-db-path ./db \
+        --bitcoind-rpc-cookie /path/to/.cookie --broadcast-via bitcoind \
+        --http-addr 127.0.0.1:3000
 
-Notes specific to this backend:
+Run `cargo test` with `BITCOIND_EXE` pointing at a `bitcoind` binary. Without it,
+the end-to-end suites skip themselves and still report success.
 
-* The Liquid build (`--features liquid`) serves the electrs-liquid shapes from
-  the same routes; see "The REST API on Liquid" below.
-* A REST scripthash is `sha256(scriptPubKey)` **as given** — unlike the Electrum
-  protocol's reversed form.
-* Bodies that the index does not store come from bitcoind's REST interface,
-  which bindex already requires: `/rest/block/notxdetails` for block metadata
-  and txids, `/rest/spenttxouts` for a whole block's prevouts in one request,
-  `/rest/tx` for mempool bodies.
-* The mempool index is filled by a poller that starts only when `--http-addr`
-  is set. It fetches the body of each new transaction once (a full mainnet
-  mempool takes a few seconds) and never resolves a prevout: an input is
-  attributed to a script by looking its outpoint up in that script's UTXO set.
-* `/tx/:txid/outspend*` has no index behind it — the `spending` column family is
-  never written — so the spender is found by scanning the funding script's index
-  rows from the funding block on. That is cheap for a normal address and
-  proportional to reuse for a hot one. `POST /internal/txs/outspends/by-txid`
-  keeps the reference's "no limit" on the batch, so it pays that cost once per
-  output of every transaction posted to it: it is bounded only by the
-  per-request deadline and the query semaphore below, and a batch of hot
-  transactions will hit the deadline rather than finish.
-* A query never holds the chain lock while it waits on the node. The index work
-  (the scripthash scan, and resolving each row to a byte range) runs under the
-  read lock; the bodies are fetched with it released, eight at a time, and the
-  tip is re-read afterwards so a fold never mixes two views of the chain. This
-  matters because the secondary refresh needs the write lock: a query that held
-  the read lock for a minute would stall the refresh and every other reader
-  behind it.
-* Bounds, all configurable: `--rest-request-timeout-secs` (30) gives up with a
-  504, `--rest-max-concurrent-queries` (4) sheds the expensive routes with a
-  503 rather than letting them crowd out the cheap ones,
-  `--rest-max-connections` (100) answers 503 instead of dropping, and
-  `--rest-header-timeout-secs` (10) / `--rest-idle-timeout-secs` (30) close
-  connections that never finish a request. Request bodies stop at
-  `--request-body-bytes-cap` (20,000,200). Only `Content-Length` framing is
-  accepted: anything ambiguous, and any `Transfer-Encoding`, is refused and the
-  connection closed.
-* `POST /txs/test` is refused under `--broadcast-via tor`: forwarding the
-  client's hex to the local node is what that mode exists to prevent, and
-  mempool.space's onion has no `testmempoolaccept` endpoint to forward to.
-* `/address-prefix/:prefix` cannot be served: the index stores an 8-byte prefix
-  of each scripthash and no addresses. It answers 400 "address search disabled"
-  by default and an empty list with `--address-search`, which an explorer's
-  search box handles as "no suggestions".
-* The address/scripthash stats object goes out with its keys sorted (the label
-  first or last, `tx_count` last), because electrs builds it with `json!`.
-* Mempool `vsize` (in `/mempool`, the fee histogram and `/mempool/recent`) is
-  `weight / 4` rounded down, as electrs computes it, not the node's figure.
-* Running a second instance against a live index needs `--secondary-path` (and
-  its own `--monitor-path`/`--cache-path`): a RocksDB secondary directory cannot
-  be shared between processes.
+bindex is MIT-licensed; see [LICENSE](LICENSE).
 
-### The REST API on Liquid
-
-With `--features liquid`, `--http-addr` serves what electrs-liquid (liquid.network)
-serves, and `--network` names the parent chain (`bitcoin` for Liquid). The
-transaction, block and outspend JSON matches liquid.network byte for byte on the
-fixtures in `bindex-electrum/tests/fixtures/liquid/` (a coinbase, a confidential
-transaction, an issuance, a reissuance, a peg-in and a peg-out):
-
-* Outputs carry `value`/`asset` when explicit and `valuecommitment`/`assetcommitment`
-  when blinded, never both; the explicit fee output is typed `fee`; a peg-out gets
-  a `pegout` object with its Bitcoin address. Inputs carry `is_pegin` and, when they
-  issue, an `issuance` object. A peg-in has no `prevout`.
-* `fee` is what the explicit fee outputs pay in L-BTC. `sigops` is counted as
-  electrs counts it (legacy only for a coinbase or any peg-in).
-* `/block/:hash` includes the header's `ext` (dynafed parameters and signblock
-  witness); the list routes leave it out. There are no `nonce`, `bits` or
-  `difficulty` fields and no `/tx/:txid/merkleblock-proof`.
-* Address stats carry counts only (no sums), summaries a zero `value`, and each
-  `/utxo` entry the output's commitments and nonce, which costs one transaction
-  fetch per UTXO. `/mempool/recent` entries have no `value`. UTXOs carry no surjection
-  or range proofs, because electrs stores outputs without their witness.
-* Prevouts come from the funding transactions: from the same block when possible,
-  otherwise one index lookup per funding transaction. The facade's `spenttxouts`
-  cannot be used for this: its Bitcoin encoding has no room for commitments.
-* Block metadata, mempool bodies and the mempool list come from Elements RPC
-  (`getblock <hash> 1`, `getrawtransaction`, `getrawmempool true`), because the
-  REST facade serves only what the indexer needs. A prevout the index does not
-  have (a pruned-region stub) falls back to `getrawtransaction`, which answers
-  only when the node runs with `-txindex`.
-* `/asset*` and `/assets*` need an asset index that does not exist here. With
-  `--asset-upstream https://liquid.network/api` they are forwarded there, status,
-  body and the registry's `X-Total-Results` included; without it they answer 404.
-
+[new]: https://img.shields.io/badge/NEW-2ea44f?style=flat-square
