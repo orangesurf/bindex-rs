@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use bitcoin::OutPoint;
-
 use crate::{
-    chain::{HeaderNotification, ScriptLocations},
-    protocol::{ElectrumScripthash, HistoryEntry, ProtocolVersion},
+    chain::{HeaderNotification, ScriptHistory},
+    protocol::{ElectrumScripthash, ProtocolVersion},
 };
 
 #[derive(Debug, Clone)]
@@ -33,16 +31,11 @@ impl Session {
     }
 }
 
-/// What a session remembers about one subscribed script, so that a mempool
-/// change costs no fetches and a new block costs one index scan unless the
-/// script's confirmed history changed.
+/// What a session remembers about one subscribed script: its confirmed
+/// history, so a mempool change is worked out without touching the index, and
+/// the status it was last sent.
 #[derive(Debug, Clone)]
 pub struct ScriptState {
-    /// The index positions the confirmed part below was built from.
-    pub locations: ScriptLocations,
-    pub confirmed: Vec<HistoryEntry>,
-    /// Confirmed unspent outputs, whose mempool spenders join the history.
-    pub utxos: Vec<OutPoint>,
-    /// The status last sent to the client.
+    pub confirmed: ScriptHistory,
     pub status: Option<String>,
 }

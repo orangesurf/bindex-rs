@@ -34,6 +34,10 @@ Notes specific to this backend:
   output of every transaction posted to it: it is bounded only by the
   per-request deadline and the query semaphore below, and a batch of hot
   transactions will hit the deadline rather than finish.
+* Script histories are cached in memory (`--script-cache-refs`, 200,000 index
+  references by default). A repeated query for the same script costs one index
+  scan; after a new block, only the new transactions are fetched and folded on.
+  A reorg through a cached script refolds it from scratch.
 * A query never holds the chain lock while it waits on the node. The index work
   (the scripthash scan, and resolving each row to a byte range) runs under the
   read lock; the bodies are fetched with it released, eight at a time, and the

@@ -61,6 +61,8 @@ each candidate is fetched and checked. Bitcoin Core 31 or later is required, wit
 - **Any Core-compatible REST source:** ![new][new] a node, or a facade in
   front of one.
 - **Catch-up mode:** ![new][new] `--once` exits when no new blocks arrive.
+- **ZMQ wake-ups:** ![new][new] with `--zmq-rawblock`, an announced block starts a
+  sync round at once instead of after the 5-second poll.
 
 ## Electrum server (`bindex-electrum`) ![new][new]
 
@@ -68,12 +70,17 @@ each candidate is fetched and checked. Bitcoin Core 31 or later is required, wit
   1.6's header arrays, `mempool.get_info` and canonical mempool ordering.
 - **Full method set:** ![new][new] headers with checkpoint proofs, script-hash
   history, balance, UTXOs and mempool, transaction and Merkle-proof lookups, fee
-  estimates and fee histograms.
+  estimates and fee histograms. Unconfirmed transactions count: a wallet sees
+  its incoming payments and its own spends before they confirm.
 - **Subscriptions:** ![new][new] header subscribers are sent each new tip, and
   script subscribers each new status, whether a block or a mempool transaction
   changed it. A mempool change costs no node requests; a new block costs one
-  index scan per subscribed script, and a full history fetch only for scripts
-  the block touched.
+  index scan per subscribed script, plus the block's transactions for the
+  scripts it touched.
+- **Script-history cache:** ![new][new] a script's folded history is kept in
+  memory, so asking again costs one index scan, and after a new block only that
+  block's transactions are fetched. `--script-cache-refs` bounds it, at 200,000
+  index references by default; a reorg through a cached script refolds it.
 - **Package broadcast:** ![new][new] `blockchain.transaction.broadcast_package`
   submits related transactions together, as Core's `submitpackage` does.
 - **Tor broadcast:** ![new][new] by default on Bitcoin, every transaction goes

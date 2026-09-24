@@ -7,7 +7,11 @@ use bindex_electrum::{
     protocol::{ElectrumScripthash, ProtocolVersion},
     server::Server,
 };
-use bitcoin::{consensus::serialize, Amount, Network};
+use bitcoin::{
+    consensus::serialize,
+    hashes::{sha256, Hash as _},
+    Amount, Network,
+};
 use corepc_node::{exe_path, Conf, Node};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -74,6 +78,54 @@ impl ElectrumClient {
             .await?
             .context("server closed connection")?;
         Ok(serde_json::from_str(&line)?)
+    }
+
+    /// Check `status` the way an Electrum wallet does: recompute it from
+    /// `get_history` (SHA-256 of `tx_hash:height:` per entry) and compare.
+    /// Returns the history.
+    async fn check_status(&mut self, scripthash: &str, status: &Value) -> anyhow::Result<Value> {
+        let history = self
+            .call("blockchain.scripthash.get_history", json!([scripthash]))
+            .await?;
+        let entries = history.as_array().context("history array")?;
+        let recomputed = if entries.is_empty() {
+            Value::Null
+        } else {
+            let payload = entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}:{}:",
+                        entry["tx_hash"].as_str().unwrap_or_default(),
+                        entry["height"]
+                    )
+                })
+                .collect::<String>();
+            json!(sha256::Hash::hash(payload.as_bytes()).to_string())
+        };
+        anyhow::ensure!(
+            &recomputed == status,
+            "status {status} does not match history {history}"
+        );
+        Ok(history)
+    }
+
+    /// `listunspent` as `(tx_hash, height, value)`, in the server's order.
+    async fn unspent(&mut self, scripthash: &str) -> anyhow::Result<Vec<(String, i64, u64)>> {
+        Ok(self
+            .call("blockchain.scripthash.listunspent", json!([scripthash]))
+            .await?
+            .as_array()
+            .context("listunspent array")?
+            .iter()
+            .map(|utxo| {
+                (
+                    utxo["tx_hash"].as_str().unwrap_or_default().to_string(),
+                    utxo["height"].as_i64().unwrap_or_default(),
+                    utxo["value"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect())
     }
 
     /// The next server notification, waiting up to `limit` for one.
@@ -342,11 +394,20 @@ async fn subscribers_are_notified_of_mempool_and_block_changes() -> anyhow::Resu
         .send_to_address(&watched, Amount::from_sat(500_000))?
         .txid()
         .context("send_to_address returned no txid")?;
+    let incoming_vout = node
+        .client
+        .get_raw_transaction(incoming)?
+        .transaction()?
+        .output
+        .iter()
+        .position(|output| output.script_pubkey == watched.script_pubkey())
+        .context("incoming output not found")?;
     let note = client.notification(limit).await?;
     assert_eq!(note["method"], "blockchain.scripthash.subscribe");
     assert_eq!(note["params"][0], scripthash);
     let incoming_status = note["params"][1].clone();
     assert_ne!(incoming_status, confirmed_status);
+    client.check_status(&scripthash, &incoming_status).await?;
     assert_eq!(
         client
             .call("blockchain.scripthash.subscribe", json!([scripthash]))
@@ -354,40 +415,78 @@ async fn subscribers_are_notified_of_mempool_and_block_changes() -> anyhow::Resu
         incoming_status,
         "resubscribing returns the status just notified"
     );
+    assert_eq!(
+        client
+            .call("blockchain.scripthash.get_balance", json!([scripthash]))
+            .await?,
+        json!({ "confirmed": 1_000_000, "unconfirmed": 500_000 })
+    );
+    assert_eq!(
+        client.unspent(&scripthash).await?,
+        vec![
+            (funding_txid.to_string(), 102, 1_000_000),
+            (incoming.to_string(), 0, 500_000),
+        ]
+    );
 
     // 2. an unconfirmed spend of the confirmed output, paying elsewhere
     node.client
         .call::<bool>("lockunspent", &[json!(true), funding_outpoint.clone()])?;
-    let spend = funding_outpoint;
-    let pay_to = json!([{ miner.to_string(): 0.0099 }]);
-    let unsigned: String = node.client.call("createrawtransaction", &[spend, pay_to])?;
-    let signed: Value = node
-        .client
-        .call("signrawtransactionwithwallet", &[json!(unsigned)])?;
-    let spend_txid: String = node
-        .client
-        .call("sendrawtransaction", &[signed["hex"].clone()])?;
+    let spend_txid = send_raw(
+        &node,
+        funding_outpoint,
+        json!([{ miner.to_string(): 0.0099 }]),
+    )?;
     let note = client.notification(limit).await?;
     assert_eq!(note["params"][0], scripthash);
-    assert_ne!(note["params"][1], incoming_status);
-    let mempool = client
-        .call("blockchain.scripthash.get_mempool", json!([scripthash]))
-        .await?;
-    let mut unconfirmed = mempool
-        .as_array()
-        .context("get_mempool array")?
-        .iter()
-        .map(|entry| entry["tx_hash"].as_str().unwrap_or_default().to_string())
-        .collect::<Vec<_>>();
-    unconfirmed.sort();
-    let mut expected = vec![incoming.to_string(), spend_txid.clone()];
-    expected.sort();
+    let spend_status = note["params"][1].clone();
+    assert_ne!(spend_status, incoming_status);
+    client.check_status(&scripthash, &spend_status).await?;
+
+    // 3. a chained payment spending the unconfirmed one: height -1
+    let chained = send_raw(
+        &node,
+        json!([{ "txid": incoming.to_string(), "vout": incoming_vout }]),
+        json!([{ watched.to_string(): 0.0049 }]),
+    )?;
+    let note = client.notification(limit).await?;
+    let chained_status = note["params"][1].clone();
+    client.check_status(&scripthash, &chained_status).await?;
+    let mut height_zero = [incoming.to_string(), spend_txid.clone()];
+    height_zero.sort();
     assert_eq!(
-        unconfirmed, expected,
-        "the spend is in the script's mempool"
+        client
+            .call("blockchain.scripthash.get_mempool", json!([scripthash]))
+            .await?
+            .as_array()
+            .context("get_mempool array")?
+            .iter()
+            .map(|entry| (
+                entry["tx_hash"].as_str().unwrap_or_default().to_string(),
+                entry["height"].as_i64().unwrap_or_default()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (height_zero[0].clone(), 0),
+            (height_zero[1].clone(), 0),
+            (chained.clone(), -1),
+        ],
+        "height 0 before -1, then by txid"
+    );
+    assert_eq!(
+        client
+            .call("blockchain.scripthash.get_balance", json!([scripthash]))
+            .await?,
+        // +500k incoming, -1M funding spent, -500k incoming spent, +490k chained
+        json!({ "confirmed": 1_000_000, "unconfirmed": -510_000 })
+    );
+    assert_eq!(
+        client.unspent(&scripthash).await?,
+        vec![(chained.clone(), 0, 490_000)],
+        "outputs spent in the mempool are not unspent"
     );
 
-    // 3. a block confirming both
+    // 4. a block confirming all three
     node.client.generate_to_address(1, &miner)?;
     writer.sync(1000)?;
     let mut header = None;
@@ -401,26 +500,35 @@ async fn subscribers_are_notified_of_mempool_and_block_changes() -> anyhow::Resu
         }
     }
     assert_eq!(header.context("header")?["height"], 103);
-    let history = client
-        .call("blockchain.scripthash.get_history", json!([scripthash]))
-        .await?;
+    let status = status.context("status")?;
+    let history = client.check_status(&scripthash, &status).await?;
     let history = history.as_array().context("history array")?;
     assert_eq!(
         history.len(),
-        3,
-        "funding, incoming payment and spend: {history:?}"
+        4,
+        "funding, incoming, spend, chained: {history:?}"
     );
     assert!(history
         .iter()
         .all(|entry| entry["height"].as_i64() > Some(0)));
     assert_eq!(
         client
+            .call("blockchain.scripthash.get_balance", json!([scripthash]))
+            .await?,
+        json!({ "confirmed": 490_000, "unconfirmed": 0 })
+    );
+    assert_eq!(
+        client.unspent(&scripthash).await?,
+        vec![(chained.clone(), 103, 490_000)]
+    );
+    assert_eq!(
+        client
             .call("blockchain.scripthash.subscribe", json!([scripthash]))
             .await?,
-        status.context("status")?
+        status
     );
 
-    // 4. unsubscribed scripts are not notified again
+    // 5. unsubscribed scripts are not notified again
     assert_eq!(
         client
             .call("blockchain.scripthash.unsubscribe", json!([scripthash]))
@@ -439,6 +547,19 @@ async fn subscribers_are_notified_of_mempool_and_block_changes() -> anyhow::Resu
 
     server_task.abort();
     Ok(())
+}
+
+/// Build, sign with the node's wallet and broadcast a transaction.
+fn send_raw(node: &Node, inputs: Value, outputs: Value) -> anyhow::Result<String> {
+    let unsigned: String = node
+        .client
+        .call("createrawtransaction", &[inputs, outputs])?;
+    let signed: Value = node
+        .client
+        .call("signrawtransactionwithwallet", &[json!(unsigned)])?;
+    Ok(node
+        .client
+        .call("sendrawtransaction", &[signed["hex"].clone()])?)
 }
 
 /// The server configuration both tests use, against `node` and the index in
@@ -465,7 +586,7 @@ fn regtest_config(
         tls_cert: None,
         tls_key: None,
         advertised_host: Vec::new(),
-        cache_path: Some(cache_dir.path().join("electrum-cache.sqlite3")),
+        script_cache_refs: 200_000,
         monitor_path: Some(cache_dir.path().join("electrum-monitor.json")),
         protocol_min: ProtocolVersion::v1_4(),
         protocol_max: ProtocolVersion::v1_6(),

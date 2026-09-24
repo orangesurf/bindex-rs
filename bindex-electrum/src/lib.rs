@@ -1,5 +1,4 @@
 pub mod bitcoind;
-pub mod cache;
 pub mod chain;
 pub mod config;
 pub mod corerest;

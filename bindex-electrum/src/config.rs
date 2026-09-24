@@ -68,8 +68,11 @@ pub struct Config {
     #[arg(long)]
     pub advertised_host: Vec<String>,
 
-    #[arg(long)]
-    pub cache_path: Option<PathBuf>,
+    /// How many index references the script-history cache may hold, summed
+    /// over the cached scripts. Each costs a few hundred bytes; a script with
+    /// more than this many transactions is never cached.
+    #[arg(long, default_value_t = 200_000)]
+    pub script_cache_refs: usize,
 
     #[arg(long)]
     pub monitor_path: Option<PathBuf>,
@@ -389,12 +392,6 @@ impl Config {
 
     pub fn secondary_refresh_interval(&self) -> Duration {
         Duration::from_millis(self.secondary_refresh_ms)
-    }
-
-    pub fn cache_path(&self) -> PathBuf {
-        self.cache_path
-            .clone()
-            .unwrap_or_else(|| self.bindex_db_path.join("electrum-cache.sqlite3"))
     }
 
     pub fn monitor_path(&self) -> PathBuf {

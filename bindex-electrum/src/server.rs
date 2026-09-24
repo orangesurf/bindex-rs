@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     future::Future,
     net::SocketAddr,
     str::FromStr,
@@ -19,15 +20,16 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::{
     bitcoind::RpcClient,
-    chain::{ChainAdapter, HeaderNotification},
+    chain::{ChainAdapter, HeaderNotification, ScriptHistory},
     config::{BroadcastVia, Config},
-    mempool::MempoolIndex,
+    deadline::Deadline,
+    mempool::{MempoolIndex, ScriptMempool},
     merkle,
     monitor::Monitor,
     protocol::{
         optional_protocol_param, params_array, parse_line, scripthash_status, serialize_response,
         serialize_responses, server_features, string_param, ElectrumScripthash,
-        Error as ProtocolError, Frame, Params, ProtocolVersion, Request, Response,
+        Error as ProtocolError, Frame, HistoryEntry, Params, ProtocolVersion, Request, Response,
     },
     session::{ScriptState, Session},
     tls,
@@ -707,78 +709,59 @@ impl Server {
 
     fn scripthash_history(&self, params: &Params) -> Result<Value, ProtocolError> {
         let scripthash = parse_scripthash(params)?;
-        let confirmed = self
-            .state
-            .chain
-            .confirmed_scripthash(scripthash)
-            .map_err(|err| ProtocolError::Server(err.to_string()))?;
-        let utxos = confirmed.utxo_outpoints();
-        let mut history = confirmed_history(confirmed.history);
-        let mut mempool = self.unconfirmed_history(scripthash, &history, &utxos);
-        history.append(&mut mempool);
-        Ok(json!(history))
+        let confirmed = self.confirmed(scripthash)?;
+        let mempool = self.mempool_view(scripthash, &confirmed);
+        Ok(json!(history_entries(&confirmed, &mempool)))
     }
 
+    /// Confirmed: the script's confirmed unspent outputs, including any a
+    /// mempool transaction spends. Unconfirmed: the mempool's net effect.
     fn scripthash_balance(&self, params: &Params) -> Result<Value, ProtocolError> {
         let scripthash = parse_scripthash(params)?;
-        let confirmed = self
-            .state
-            .chain
-            .confirmed_scripthash(scripthash)
-            .map_err(|err| ProtocolError::Server(err.to_string()))?
-            .utxos
-            .into_iter()
-            .map(|utxo| utxo.value)
-            .sum::<u64>();
-        let unconfirmed = 0i64;
-        Ok(json!({ "confirmed": confirmed, "unconfirmed": unconfirmed }))
+        let confirmed = self.confirmed(scripthash)?;
+        let mempool = self.mempool_view(scripthash, &confirmed);
+        let balance = confirmed.utxos.iter().map(|utxo| utxo.value).sum::<u64>();
+        Ok(json!({ "confirmed": balance, "unconfirmed": mempool.balance_delta }))
     }
 
+    /// Confirmed outputs in chain order, minus those spent in the mempool, then
+    /// the mempool's unspent outputs at height 0.
     fn scripthash_listunspent(&self, params: &Params) -> Result<Value, ProtocolError> {
         let scripthash = parse_scripthash(params)?;
-        let utxos = self
-            .state
-            .chain
-            .confirmed_scripthash(scripthash)
-            .map_err(|err| ProtocolError::Server(err.to_string()))?
-            .utxos;
-        Ok(json!(utxos
-            .into_iter()
-            .map(|utxo| json!({
-                "tx_hash": utxo.tx_hash,
-                "tx_pos": utxo.tx_pos,
+        let confirmed = self.confirmed(scripthash)?;
+        let mempool = self.mempool_view(scripthash, &confirmed);
+        let mut utxos = confirmed
+            .utxos
+            .iter()
+            .filter(|utxo| !mempool.spent_confirmed.contains(&utxo.outpoint))
+            .collect::<Vec<_>>();
+        utxos.sort_by_key(|utxo| (utxo.height, utxo.position, utxo.outpoint.vout));
+        let confirmed = utxos.into_iter().map(|utxo| {
+            json!({
+                "tx_hash": utxo.outpoint.txid.to_string(),
+                "tx_pos": utxo.outpoint.vout,
                 "height": utxo.height,
-                "value": utxo.value
-            }))
-            .collect::<Vec<_>>()))
+                "value": utxo.value,
+            })
+        });
+        let unconfirmed = mempool.utxos.iter().map(|(outpoint, value)| {
+            json!({
+                "tx_hash": outpoint.txid.to_string(),
+                "tx_pos": outpoint.vout,
+                "height": 0,
+                "value": value,
+            })
+        });
+        Ok(json!(confirmed.chain(unconfirmed).collect::<Vec<_>>()))
     }
 
     /// Unconfirmed transactions paying or spending from the script. Finding the
-    /// spends of its confirmed outputs needs its confirmed state, so this costs
-    /// what `get_history` costs.
+    /// spends of its confirmed outputs needs its confirmed state, which comes
+    /// from the script-history cache.
     fn scripthash_mempool(&self, params: &Params) -> Result<Value, ProtocolError> {
         let scripthash = parse_scripthash(params)?;
-        let confirmed = self
-            .state
-            .chain
-            .confirmed_scripthash(scripthash)
-            .map_err(|err| ProtocolError::Server(err.to_string()))?;
-        let utxos = confirmed.utxo_outpoints();
-        // as in unconfirmed_history: skip what the index already has as mined
-        let mined = confirmed
-            .history
-            .iter()
-            .map(|tx| tx.tx_hash.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        Ok(json!(self
-            .state
-            .mempool
-            .read()
-            .unwrap()
-            .script_entries(scripthash, &utxos)
-            .into_iter()
-            .filter(|entry| !mined.contains(entry.tx_hash.as_str()))
-            .collect::<Vec<_>>()))
+        let confirmed = self.confirmed(scripthash)?;
+        Ok(json!(self.mempool_view(scripthash, &confirmed).entries))
     }
 
     fn scripthash_subscribe(
@@ -794,65 +777,65 @@ impl Server {
                 "subscription limit exceeded".to_string(),
             ));
         }
-        let mut state = self
-            .script_state(scripthash)
-            .map_err(|err| ProtocolError::Server(err.to_string()))?;
-        state.status = self.script_status(scripthash, &state);
-        let status = state.status.clone();
-        session.scripthashes.insert(scripthash, state);
+        let confirmed = self.confirmed(scripthash)?;
+        let status = self.script_status(scripthash, &confirmed);
+        session.scripthashes.insert(
+            scripthash,
+            ScriptState {
+                confirmed,
+                status: status.clone(),
+            },
+        );
         Ok(json!(status))
     }
 
-    /// A script's confirmed state, as a session keeps it for a subscription.
-    /// The locations are read first: if the chain moves in between, they are
-    /// older than the history, and the next tip change rebuilds the state.
-    fn script_state(
-        &self,
-        scripthash: ElectrumScripthash,
-    ) -> Result<ScriptState, crate::chain::Error> {
-        let locations = self.state.chain.scripthash_locations(scripthash)?;
-        let confirmed = self.state.chain.confirmed_scripthash(scripthash)?;
-        Ok(ScriptState {
-            locations,
-            utxos: confirmed.utxo_outpoints(),
-            confirmed: confirmed_history(confirmed.history),
-            status: None,
-        })
+    /// The script's confirmed history, from the script-history cache: one
+    /// index scan when nothing changed, and only new blocks' transactions
+    /// fetched when something did.
+    fn confirmed(&self, scripthash: ElectrumScripthash) -> Result<ScriptHistory, ProtocolError> {
+        self.state
+            .chain
+            .script_history(scripthash, &Deadline::never())
+            .map_err(|err| ProtocolError::Server(err.to_string()))
     }
 
-    /// The script's status from its confirmed state and the current mempool.
-    fn script_status(&self, scripthash: ElectrumScripthash, state: &ScriptState) -> Option<String> {
-        let mut history = state.confirmed.clone();
-        history.extend(self.unconfirmed_history(scripthash, &state.confirmed, &state.utxos));
-        scripthash_status(&history)
-    }
-
-    /// The script's mempool entries, minus any the index already has as
-    /// confirmed: between an index refresh and the next mempool poll, a newly
-    /// mined transaction is in both.
-    fn unconfirmed_history(
+    fn mempool_view(
         &self,
         scripthash: ElectrumScripthash,
-        confirmed: &[crate::protocol::HistoryEntry],
-        utxos: &[bitcoin::OutPoint],
-    ) -> Vec<crate::protocol::HistoryEntry> {
-        let confirmed = confirmed
+        confirmed: &ScriptHistory,
+    ) -> ScriptMempool {
+        let utxos = confirmed
+            .utxos
             .iter()
-            .map(|entry| entry.tx_hash.as_str())
-            .collect::<std::collections::HashSet<_>>();
+            .map(|utxo| (utxo.outpoint, utxo.value))
+            .collect::<Vec<_>>();
+        let mined = confirmed
+            .rows
+            .iter()
+            .map(|row| row.txid)
+            .collect::<HashSet<_>>();
         self.state
             .mempool
             .read()
             .unwrap()
-            .script_history_entries(scripthash, utxos)
-            .into_iter()
-            .filter(|entry| !confirmed.contains(entry.tx_hash.as_str()))
-            .collect()
+            .script_view(scripthash, &utxos, &mined)
+    }
+
+    /// The script's status from its confirmed history and the current mempool.
+    fn script_status(
+        &self,
+        scripthash: ElectrumScripthash,
+        confirmed: &ScriptHistory,
+    ) -> Option<String> {
+        let mempool = self.mempool_view(scripthash, confirmed);
+        scripthash_status(&history_entries(confirmed, &mempool))
     }
 
     /// The notifications a session is owed after the tip or mempool changed:
     /// the new tip if it subscribed to headers, and every subscribed script
-    /// whose status differs from the one it was last sent.
+    /// whose status differs from the one it was last sent. A mempool change is
+    /// worked out from the session's copy of each script's confirmed history,
+    /// with no index or node access; a new tip refreshes that copy first.
     fn notifications(&self, session: &mut Session, changes: &Changes) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         if session.header_subscribed && changes.tip != session.last_header {
@@ -865,27 +848,15 @@ impl Server {
         let tip_changed = changes.tip != session.checked_tip;
         for (scripthash, state) in session.scripthashes.iter_mut() {
             if tip_changed {
-                // one index scan; fetch bodies only if the script's rows moved
-                match self.state.chain.scripthash_locations(*scripthash) {
-                    Ok(locations) if locations == state.locations => {}
-                    Ok(_) => match self.script_state(*scripthash) {
-                        Ok(fresh) => {
-                            let sent = state.status.take();
-                            *state = fresh;
-                            state.status = sent;
-                        }
-                        Err(err) => {
-                            log::warn!("refresh subscription {scripthash}: {err}");
-                            continue;
-                        }
-                    },
+                match self.confirmed(*scripthash) {
+                    Ok(confirmed) => state.confirmed = confirmed,
                     Err(err) => {
-                        log::warn!("check subscription {scripthash}: {err}");
+                        log::warn!("refresh subscription {scripthash}: {err}");
                         continue;
                     }
                 }
             }
-            let status = self.script_status(*scripthash, state);
+            let status = self.script_status(*scripthash, &state.confirmed);
             if status != state.status {
                 out.push(notification(
                     "blockchain.scripthash.subscribe",
@@ -973,17 +944,20 @@ fn notification(method: &str, params: Value) -> Vec<u8> {
     bytes
 }
 
-fn confirmed_history(
-    history: Vec<crate::chain::ConfirmedTx>,
-) -> Vec<crate::protocol::HistoryEntry> {
-    history
-        .into_iter()
-        .map(|tx| crate::protocol::HistoryEntry {
-            tx_hash: tx.tx_hash,
-            height: tx.height as i64,
-            fee: None,
-        })
-        .collect()
+/// A script's history as the protocol lists it: confirmed transactions in
+/// chain order, then the mempool's in canonical order, with their fees.
+fn history_entries(confirmed: &ScriptHistory, mempool: &ScriptMempool) -> Vec<HistoryEntry> {
+    let confirmed = confirmed.rows.iter().map(|row| HistoryEntry {
+        tx_hash: row.txid.to_string(),
+        height: row.height as i64,
+        fee: None,
+    });
+    let unconfirmed = mempool.entries.iter().map(|entry| HistoryEntry {
+        tx_hash: entry.tx_hash.clone(),
+        height: entry.height,
+        fee: Some(entry.fee),
+    });
+    confirmed.chain(unconfirmed).collect()
 }
 
 fn merkle_value(height: usize, txids: &[Txid], pos: usize) -> Value {

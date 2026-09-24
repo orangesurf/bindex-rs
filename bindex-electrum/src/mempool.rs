@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::RwLock,
 };
 
@@ -16,6 +16,23 @@ pub struct MempoolEntry {
     pub tx_hash: String,
     pub height: i64,
     pub fee: u64,
+}
+
+/// One script's share of the mempool, as the Electrum methods need it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptMempool {
+    /// Transactions paying or spending from the script, height `0` (all inputs
+    /// confirmed) before `-1` (an unconfirmed input), then by txid as hex: the
+    /// protocol's canonical order.
+    pub entries: Vec<MempoolEntry>,
+    /// What the mempool pays the script minus what it spends of the script's
+    /// outputs, confirmed or not.
+    pub balance_delta: i64,
+    /// Unconfirmed outputs paying the script that nothing in the mempool
+    /// spends, by txid as hex then output index.
+    pub utxos: Vec<(OutPoint, u64)>,
+    /// The script's confirmed outputs that a mempool transaction spends.
+    pub spent_confirmed: BTreeSet<OutPoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,38 +173,74 @@ impl MempoolIndex {
         txids
     }
 
-    /// [`Self::script_txids`] as `get_mempool` entries, in txid order.
-    pub fn script_entries(
+    /// The script's share of the mempool, given its confirmed unspent outputs.
+    /// Transactions in `mined` are skipped: between an index refresh and the
+    /// next mempool poll, a newly mined transaction is in both.
+    pub fn script_view(
         &self,
         scripthash: ElectrumScripthash,
-        confirmed_outputs: &[OutPoint],
-    ) -> Vec<MempoolEntry> {
-        self.script_txids(scripthash, confirmed_outputs)
+        confirmed_utxos: &[(OutPoint, u64)],
+        mined: &HashSet<Txid>,
+    ) -> ScriptMempool {
+        let confirmed_outpoints = confirmed_utxos
             .iter()
-            .filter_map(|txid| self.txs.get(txid))
-            .map(|tx| MempoolEntry {
-                tx_hash: tx.txid.to_string(),
-                height: 0,
-                fee: tx.fee,
-            })
-            .collect()
-    }
-
-    /// [`Self::script_entries`] as history entries, for `get_history` and the
-    /// script's status.
-    pub fn script_history_entries(
-        &self,
-        scripthash: ElectrumScripthash,
-        confirmed_outputs: &[OutPoint],
-    ) -> Vec<HistoryEntry> {
-        self.script_entries(scripthash, confirmed_outputs)
+            .map(|(outpoint, _)| *outpoint)
+            .collect::<Vec<_>>();
+        let txs = self
+            .script_txids(scripthash, &confirmed_outpoints)
             .into_iter()
-            .map(|entry| HistoryEntry {
-                tx_hash: entry.tx_hash,
-                height: entry.height,
-                fee: Some(entry.fee),
-            })
-            .collect()
+            .filter(|txid| !mined.contains(txid))
+            .filter_map(|txid| self.txs.get(&txid))
+            .collect::<Vec<_>>();
+
+        let mut view = ScriptMempool::default();
+        let mut outputs = Vec::new();
+        for tx in &txs {
+            let unconfirmed_parent = tx.spends.iter().any(|prevout| {
+                self.txs.contains_key(&prevout.txid) && !mined.contains(&prevout.txid)
+            });
+            view.entries.push(MempoolEntry {
+                tx_hash: tx.txid.to_string(),
+                height: if unconfirmed_parent { -1 } else { 0 },
+                fee: tx.fee,
+            });
+            for (vout, (output_scripthash, value)) in &tx.outputs {
+                if *output_scripthash == scripthash {
+                    outputs.push((
+                        OutPoint {
+                            txid: tx.txid,
+                            vout: *vout,
+                        },
+                        *value,
+                    ));
+                    view.balance_delta += *value as i64;
+                }
+            }
+        }
+        view.entries
+            .sort_by(|a, b| (-a.height, &a.tx_hash).cmp(&(-b.height, &b.tx_hash)));
+
+        let spent = |outpoint: &OutPoint| {
+            self.spent_prevouts
+                .get(outpoint)
+                .is_some_and(|spender| !mined.contains(spender))
+        };
+        for (outpoint, value) in confirmed_utxos {
+            if spent(outpoint) {
+                view.spent_confirmed.insert(*outpoint);
+                view.balance_delta -= *value as i64;
+            }
+        }
+        for (outpoint, value) in outputs {
+            if spent(&outpoint) {
+                view.balance_delta -= value as i64;
+            } else {
+                view.utxos.push((outpoint, value));
+            }
+        }
+        view.utxos
+            .sort_by_key(|(outpoint, _)| (outpoint.txid.to_string(), outpoint.vout));
+        view
     }
 
     pub fn history_entries(&self, scripthash: ElectrumScripthash) -> Vec<HistoryEntry> {
@@ -571,6 +624,102 @@ mod tests {
             index.script_txids(sh, &[]),
             [pays_it, spends_unconfirmed].into_iter().collect()
         );
+    }
+
+    /// Canonical order and heights, the balance delta, and which outputs are
+    /// still unspent, for a confirmed output spent by a mempool transaction
+    /// whose own output is spent again by a chained one.
+    #[test]
+    fn script_view_orders_values_and_skips_mined() {
+        let sh = ElectrumScripthash::parse(&"22".repeat(32)).unwrap();
+        let other = ElectrumScripthash::parse(&"33".repeat(32)).unwrap();
+        let txid = |name: &[u8]| Txid::from_raw_hash(sha256d::Hash::hash(name));
+        let tx = |id: Txid, spends: &[OutPoint], pays: &[(ElectrumScripthash, u64)]| MempoolTx {
+            txid: id,
+            raw: Vec::new(),
+            fee: 100,
+            vsize: 50,
+            ancestor_fees: 100,
+            ancestor_vsize: 50,
+            time: 0,
+            touches: pays.iter().map(|(sh, _)| *sh).collect(),
+            spends: spends.iter().copied().collect(),
+            outputs: pays
+                .iter()
+                .enumerate()
+                .map(|(vout, pay)| (vout as u32, *pay))
+                .collect(),
+        };
+        let confirmed = OutPoint {
+            txid: txid(b"confirmed funding"),
+            vout: 0,
+        };
+        let (spend, chained, incoming) = (txid(b"spend"), txid(b"chained"), txid(b"incoming"));
+        let mut index = MempoolIndex::default();
+        // spends the confirmed 10_000 output: 6_000 back to the script
+        index.insert(tx(spend, &[confirmed], &[(sh, 6_000), (other, 3_000)]));
+        // spends that change: height -1
+        index.insert(tx(
+            chained,
+            &[OutPoint {
+                txid: spend,
+                vout: 0,
+            }],
+            &[(other, 5_000)],
+        ));
+        index.insert(tx(incoming, &[], &[(sh, 2_000)]));
+
+        let view = index.script_view(sh, &[(confirmed, 10_000)], &HashSet::new());
+        let mut height_zero = [spend, incoming].map(|txid| txid.to_string());
+        height_zero.sort();
+        assert_eq!(
+            view.entries
+                .iter()
+                .map(|e| (e.tx_hash.clone(), e.height))
+                .collect::<Vec<_>>(),
+            vec![
+                (height_zero[0].clone(), 0),
+                (height_zero[1].clone(), 0),
+                (chained.to_string(), -1),
+            ]
+        );
+        // +6_000 +2_000 paid, -10_000 confirmed and -6_000 unconfirmed spent
+        assert_eq!(view.balance_delta, -8_000);
+        assert_eq!(
+            view.utxos,
+            vec![(
+                OutPoint {
+                    txid: incoming,
+                    vout: 0
+                },
+                2_000
+            )]
+        );
+        assert_eq!(view.spent_confirmed, [confirmed].into_iter().collect());
+
+        // once the index has `spend` as mined, it leaves the view; `chained`
+        // then has only a confirmed parent
+        let mined = [spend].into_iter().collect();
+        let view = index.script_view(
+            sh,
+            &[(
+                OutPoint {
+                    txid: spend,
+                    vout: 0,
+                },
+                6_000,
+            )],
+            &mined,
+        );
+        assert!(view
+            .entries
+            .iter()
+            .all(|entry| entry.tx_hash != spend.to_string()));
+        assert!(view
+            .entries
+            .iter()
+            .any(|entry| entry.tx_hash == chained.to_string() && entry.height == 0));
+        assert_eq!(view.balance_delta, 2_000 - 6_000);
     }
 
     #[test]

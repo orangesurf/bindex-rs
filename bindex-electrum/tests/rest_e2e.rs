@@ -163,8 +163,6 @@ async fn rest_api_serves_a_regtest_chain() -> anyhow::Result<()> {
         node.params.cookie_file.to_str().context("cookie path")?,
         "--tcp-listen",
         "127.0.0.1:0",
-        "--cache-path",
-        state_dir.path().join("cache.sqlite3").to_str().context("cache")?,
         "--monitor-path",
         state_dir.path().join("monitor.json").to_str().context("monitor")?,
         "--mempool-poll-secs",
@@ -815,8 +813,6 @@ async fn tor_mode_refuses_local_submission_and_the_utxo_cap_is_historical(
         node.params.cookie_file.to_str().context("cookie path")?,
         "--tcp-listen",
         "127.0.0.1:0",
-        "--cache-path",
-        state_dir.path().join("cache.sqlite3").to_str().context("cache")?,
         "--monitor-path",
         state_dir.path().join("monitor.json").to_str().context("monitor")?,
         "--broadcast-via",
@@ -933,12 +929,6 @@ async fn zmq_announcements_wake_the_refresh_and_the_mempool_poll() -> anyhow::Re
         node.params.cookie_file.to_str().context("cookie path")?,
         "--tcp-listen",
         "127.0.0.1:0",
-        "--cache-path",
-        state_dir
-            .path()
-            .join("cache.sqlite3")
-            .to_str()
-            .context("cache")?,
         "--monitor-path",
         state_dir
             .path()

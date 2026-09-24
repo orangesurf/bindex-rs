@@ -11,6 +11,12 @@ bindex = { path = "../bindex-lib" }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
+tokio = { version = "1", features = ["rt", "time"] }
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
 [features]
 liquid = ["bindex/liquid"]
+
+[dev-dependencies]
+corepc-node = { version = "0.12", default-features = false, features = ["30_0"] }
+tempfile = "3"

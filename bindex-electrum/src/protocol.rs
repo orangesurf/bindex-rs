@@ -301,6 +301,10 @@ pub struct HistoryEntry {
     pub fee: Option<u64>,
 }
 
+/// The protocol's script status: the SHA-256 of `tx_hash:height:` for each
+/// history entry in order, or `None` for an empty history. Fees are not part of
+/// it; wallets recompute it from `get_history` and must arrive at the same
+/// string.
 pub fn scripthash_status(history: &[HistoryEntry]) -> Option<String> {
     if history.is_empty() {
         return None;
@@ -310,12 +314,6 @@ pub fn scripthash_status(history: &[HistoryEntry]) -> Option<String> {
         payload.push_str(&item.tx_hash);
         payload.push(':');
         payload.push_str(&item.height.to_string());
-        if item.height <= 0 {
-            if let Some(fee) = item.fee {
-                payload.push(':');
-                payload.push_str(&fee.to_string());
-            }
-        }
         payload.push(':');
     }
     Some(sha256::Hash::hash(payload.as_bytes()).to_string())
@@ -443,7 +441,7 @@ mod tests {
             scripthash_status(&history),
             Some(
                 sha256::Hash::hash(
-                    format!("{}:100:{}:0:250:", "a".repeat(64), "b".repeat(64)).as_bytes()
+                    format!("{}:100:{}:0:", "a".repeat(64), "b".repeat(64)).as_bytes()
                 )
                 .to_string()
             )

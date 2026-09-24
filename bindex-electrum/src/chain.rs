@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, RwLock},
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -69,48 +69,6 @@ pub struct LocatedTx {
     pub position: u32,
     pub confirmations: usize,
 }
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ConfirmedTx {
-    pub tx_hash: String,
-    pub height: usize,
-    pub position: u32,
-    pub raw: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ConfirmedUtxo {
-    pub tx_hash: String,
-    pub tx_pos: u32,
-    pub height: i64,
-    pub value: u64,
-    pub script_pubkey: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConfirmedScripthash {
-    pub history: Vec<ConfirmedTx>,
-    pub utxos: Vec<ConfirmedUtxo>,
-}
-
-impl ConfirmedScripthash {
-    /// The unspent outputs as outpoints, for finding their mempool spenders.
-    pub fn utxo_outpoints(&self) -> Vec<OutPoint> {
-        self.utxos
-            .iter()
-            .filter_map(|utxo| {
-                Some(OutPoint {
-                    txid: utxo.tx_hash.parse().ok()?,
-                    vout: utxo.tx_pos,
-                })
-            })
-            .collect()
-    }
-}
-
-/// Where a script's candidate transactions sit: height, block hash and
-/// position in the block. Taken from the index alone.
-pub type ScriptLocations = Vec<(usize, bitcoin::BlockHash, u32)>;
 
 /// Bodies fetched (and deadline-checked) per round.
 const FETCH_BATCH: usize = 512;
@@ -185,6 +143,7 @@ pub struct ChainAdapter {
     core: CoreRest,
     refresh_interval: Duration,
     last_refresh: Arc<RwLock<Instant>>,
+    scripts: Arc<Mutex<ScriptCache>>,
 }
 
 impl ChainAdapter {
@@ -202,6 +161,7 @@ impl ChainAdapter {
             core: CoreRest::new(config.bitcoind_rest_url.clone()),
             refresh_interval: config.secondary_refresh_interval(),
             last_refresh: Arc::new(RwLock::new(Instant::now())),
+            scripts: Arc::new(Mutex::new(ScriptCache::new(config.script_cache_refs))),
         })
     }
 
@@ -321,114 +281,6 @@ impl ChainAdapter {
         })
     }
 
-    pub fn confirmed_history(
-        &self,
-        scripthash: ElectrumScripthash,
-    ) -> Result<Vec<ConfirmedTx>, Error> {
-        Ok(self.confirmed_scripthash(scripthash)?.history)
-    }
-
-    /// The positions of a script's candidate transactions, from the index
-    /// alone: no bodies are fetched, and prefix false positives are included.
-    /// Two equal results mean the confirmed history cannot have changed,
-    /// which makes this cheap enough to run for every subscription on every
-    /// new block.
-    pub fn scripthash_locations(
-        &self,
-        scripthash: ElectrumScripthash,
-    ) -> Result<ScriptLocations, Error> {
-        let chain = self.chain.read().map_err(|_| Error::Lock)?;
-        let bindex_hash = scripthash
-            .to_bindex()
-            .map_err(|_| Error::InvalidScripthash)?;
-        let mut locations = chain
-            .locations_by_scripthash(&bindex_hash, None)?
-            .map(|location| {
-                (
-                    location.block_height(),
-                    location.block_hash(),
-                    location.block_position(),
-                )
-            })
-            .collect::<Vec<_>>();
-        locations.sort();
-        locations.dedup();
-        Ok(locations)
-    }
-
-    pub fn confirmed_scripthash(
-        &self,
-        scripthash: ElectrumScripthash,
-    ) -> Result<ConfirmedScripthash, Error> {
-        let chain = self.chain.read().map_err(|_| Error::Lock)?;
-        let bindex_hash = scripthash
-            .to_bindex()
-            .map_err(|_| Error::InvalidScripthash)?;
-        let mut locations = chain
-            .locations_by_scripthash(&bindex_hash, None)?
-            .collect::<Vec<_>>();
-        locations.sort();
-        locations.dedup();
-
-        let mut rows = Vec::new();
-        let mut outputs = BTreeMap::<OutPoint, ConfirmedUtxo>::new();
-        let mut spent = BTreeSet::<OutPoint>::new();
-
-        for location in locations {
-            let raw = chain.get_tx_bytes(&location)?;
-            let tx = fmt::parse_tx(&raw)?;
-            let txid = tx.txid;
-            let mut touches = false;
-
-            for (vout, output) in tx.outputs.iter().enumerate() {
-                if ElectrumScripthash::from_script(bitcoin::Script::from_bytes(&output.script_pubkey)) == scripthash {
-                    touches = true;
-                    outputs.insert(
-                        OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        ConfirmedUtxo {
-                            tx_hash: txid.to_string(),
-                            tx_pos: vout as u32,
-                            height: location.block_height() as i64,
-                            value: output.value,
-                            script_pubkey: output.script_pubkey.clone(),
-                        },
-                    );
-                }
-            }
-
-            for prevout in &tx.inputs {
-                if self.prevout_matches_scripthash(&chain, *prevout, scripthash)? {
-                    touches = true;
-                    spent.insert(*prevout);
-                }
-            }
-
-            if touches {
-                rows.push(ConfirmedTx {
-                    tx_hash: txid.to_string(),
-                    height: location.block_height(),
-                    position: location.block_position(),
-                    raw,
-                });
-            }
-        }
-        rows.sort_by_key(|row| (row.height, row.position));
-        rows.dedup_by_key(|row| row.tx_hash.clone());
-
-        let utxos = outputs
-            .into_iter()
-            .filter_map(|(outpoint, utxo)| (!spent.contains(&outpoint)).then_some(utxo))
-            .collect();
-
-        Ok(ConfirmedScripthash {
-            history: rows,
-            utxos,
-        })
-    }
-
     pub fn transaction_by_txid(&self, txid: &bitcoin::Txid) -> Result<Option<Vec<u8>>, Error> {
         Ok(self.located_transaction_by_txid(txid)?.map(|t| t.raw))
     }
@@ -515,6 +367,12 @@ impl ChainAdapter {
     /// secondary refresh (which needs the write lock) and every other reader
     /// behind it. The tip is re-read afterwards: if the chain moved under the
     /// fetch the whole query is redone rather than folded from a mixed view.
+    ///
+    /// Folds are cached. When the index still lists the same transactions for
+    /// the script, the cached history is returned after one index scan; when it
+    /// lists the cached ones plus some at the end (new blocks), only those are
+    /// fetched and folded on. Anything else, such as a reorg replacing a block
+    /// the script had a transaction in, refolds from scratch.
     pub fn script_history(
         &self,
         scripthash: ElectrumScripthash,
@@ -522,14 +380,41 @@ impl ChainAdapter {
     ) -> Result<ScriptHistory, Error> {
         for _ in 0..REORG_RETRIES {
             let (tip, refs) = self.script_refs(scripthash, None)?;
-            let mut bodies = Vec::with_capacity(refs.len());
-            for batch in refs.chunks(FETCH_BATCH) {
+            let cached = self
+                .scripts
+                .lock()
+                .map_err(|_| Error::Lock)?
+                .get(scripthash);
+            let (mut fold, start) = match cached {
+                Some(cached) if refs.starts_with(&cached.refs) => {
+                    if refs.len() == cached.refs.len() {
+                        return Ok(cached.history.clone());
+                    }
+                    (cached.fold.clone(), cached.refs.len())
+                }
+                _ => (Fold::default(), 0),
+            };
+            let tail = &refs[start..];
+            let mut bodies = Vec::with_capacity(tail.len());
+            for batch in tail.chunks(FETCH_BATCH) {
                 bodies.extend(self.fetch_bodies(batch, deadline)?);
             }
             if self.tip_hash()? != tip {
                 continue;
             }
-            return fold_history(scripthash, &refs, &bodies);
+            for (reference, raw) in tail.iter().zip(&bodies) {
+                fold.apply(scripthash, reference, raw)?;
+            }
+            let history = fold.finish();
+            self.scripts.lock().map_err(|_| Error::Lock)?.put(
+                scripthash,
+                CachedScript {
+                    refs,
+                    fold,
+                    history: history.clone(),
+                },
+            );
+            return Ok(history);
         }
         Err(Error::Reorg)
     }
@@ -657,41 +542,28 @@ impl ChainAdapter {
             .block_part(&reference.block_hash, reference.offset, reference.size)?)
     }
 
-    fn prevout_matches_scripthash(
-        &self,
-        chain: &bindex::IndexedChain,
-        outpoint: OutPoint,
-        scripthash: ElectrumScripthash,
-    ) -> Result<bool, Error> {
-        for location in chain.locations_by_txid(&outpoint.txid)? {
-            let raw = chain.get_tx_bytes(&location)?;
-            let tx = fmt::parse_tx(&raw)?;
-            if tx.txid != outpoint.txid {
-                continue;
-            }
-            let Some(output) = tx.outputs.get(outpoint.vout as usize) else {
-                return Ok(false);
-            };
-            return Ok(
-                ElectrumScripthash::from_script(bitcoin::Script::from_bytes(&output.script_pubkey)) == scripthash,
-            );
-        }
-        Ok(false)
-    }
 }
 
-/// Fold a script's history from already-fetched bodies. No locks, no IO.
-fn fold_history(
-    scripthash: ElectrumScripthash,
-    refs: &[bindex::TxBytesRef],
-    bodies: &[Vec<u8>],
-) -> Result<ScriptHistory, Error> {
-    let mut history = ScriptHistory::default();
-    // every output ever paid to this script, for valuing the spends
-    let mut funded = BTreeMap::<OutPoint, u64>::new();
-    let mut live = BTreeMap::<OutPoint, ScriptUtxo>::new();
+/// A script's history folded up to some transaction, kept whole so that a
+/// longer history (the same transactions plus new blocks) can be folded on from
+/// where it stopped. No locks, no IO.
+#[derive(Debug, Clone, Default)]
+struct Fold {
+    /// Rows and counters so far; `utxos` is filled in by [`Fold::finish`].
+    history: ScriptHistory,
+    /// Every output ever paid to the script, for valuing its spends.
+    funded: BTreeMap<OutPoint, u64>,
+    live: BTreeMap<OutPoint, ScriptUtxo>,
+}
 
-    for (reference, raw) in refs.iter().zip(bodies) {
+impl Fold {
+    /// Fold in the next transaction, in chain order.
+    fn apply(
+        &mut self,
+        scripthash: ElectrumScripthash,
+        reference: &bindex::TxBytesRef,
+        raw: &[u8],
+    ) -> Result<(), Error> {
         let tx = fmt::parse_tx(raw)?;
         let txid = tx.txid;
         let mut row = ScriptHistoryRow {
@@ -705,10 +577,10 @@ fn fold_history(
         };
 
         for prevout in &tx.inputs {
-            if let Some(value) = funded.get(prevout) {
+            if let Some(value) = self.funded.get(prevout) {
                 row.spent += value;
                 row.spent_count += 1;
-                live.remove(prevout);
+                self.live.remove(prevout);
             }
         }
         for (vout, output) in tx.outputs.iter().enumerate() {
@@ -723,8 +595,8 @@ fn fold_history(
             };
             row.funded += output.value;
             row.funded_count += 1;
-            funded.insert(outpoint, output.value);
-            live.insert(
+            self.funded.insert(outpoint, output.value);
+            self.live.insert(
                 outpoint,
                 ScriptUtxo {
                     outpoint,
@@ -735,18 +607,130 @@ fn fold_history(
             );
         }
 
-        history.peak_live_utxos = history.peak_live_utxos.max(live.len());
+        self.history.peak_live_utxos = self.history.peak_live_utxos.max(self.live.len());
         // an index prefix collision touches neither side
         if row.funded_count > 0 || row.spent_count > 0 {
-            history.funded_txo_count += row.funded_count;
-            history.funded_txo_sum += row.funded;
-            history.spent_txo_count += row.spent_count;
-            history.spent_txo_sum += row.spent;
-            history.rows.push(row);
+            self.history.funded_txo_count += row.funded_count;
+            self.history.funded_txo_sum += row.funded;
+            self.history.spent_txo_count += row.spent_count;
+            self.history.spent_txo_sum += row.spent;
+            self.history.rows.push(row);
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> ScriptHistory {
+        let mut history = self.history.clone();
+        history.rows.sort_by_key(|row| (row.height, row.position));
+        history.utxos = self.live.values().cloned().collect();
+        history
+    }
+}
+
+/// A script's fold and the index references it was built from.
+struct CachedScript {
+    refs: Vec<bindex::TxBytesRef>,
+    fold: Fold,
+    history: ScriptHistory,
+}
+
+/// Recently folded scripts, least recently used evicted first. The bound is
+/// on index references, which is what a fold's memory grows with.
+struct ScriptCache {
+    entries: HashMap<ElectrumScripthash, (Arc<CachedScript>, u64)>,
+    refs: usize,
+    max_refs: usize,
+    clock: u64,
+}
+
+impl ScriptCache {
+    fn new(max_refs: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            refs: 0,
+            max_refs,
+            clock: 0,
         }
     }
 
-    history.rows.sort_by_key(|row| (row.height, row.position));
-    history.utxos = live.into_values().collect();
-    Ok(history)
+    fn get(&mut self, scripthash: ElectrumScripthash) -> Option<Arc<CachedScript>> {
+        self.clock += 1;
+        let (cached, used) = self.entries.get_mut(&scripthash)?;
+        *used = self.clock;
+        Some(Arc::clone(cached))
+    }
+
+    fn put(&mut self, scripthash: ElectrumScripthash, cached: CachedScript) {
+        if let Some((old, _)) = self.entries.remove(&scripthash) {
+            self.refs -= old.refs.len();
+        }
+        // a script larger than the whole cache is not worth evicting everything for
+        if cached.refs.len() > self.max_refs {
+            return;
+        }
+        self.clock += 1;
+        self.refs += cached.refs.len();
+        self.entries
+            .insert(scripthash, (Arc::new(cached), self.clock));
+        while self.refs > self.max_refs {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(scripthash, _)| *scripthash)
+            else {
+                break;
+            };
+            if let Some((evicted, _)) = self.entries.remove(&oldest) {
+                self.refs -= evicted.refs.len();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod script_cache_tests {
+    use super::*;
+    use bitcoin::hashes::Hash as _;
+
+    fn cached(refs: usize) -> CachedScript {
+        let reference = bindex::TxBytesRef {
+            block_hash: bitcoin::BlockHash::all_zeros(),
+            block_height: 0,
+            block_position: 0,
+            offset: 0,
+            size: 0,
+        };
+        CachedScript {
+            refs: vec![reference; refs],
+            fold: Fold::default(),
+            history: ScriptHistory::default(),
+        }
+    }
+
+    fn scripthash(byte: u8) -> ElectrumScripthash {
+        ElectrumScripthash([byte; 32])
+    }
+
+    #[test]
+    fn evicts_least_recently_used_and_skips_oversized() {
+        let mut cache = ScriptCache::new(10);
+        cache.put(scripthash(1), cached(4));
+        cache.put(scripthash(2), cached(4));
+        assert!(cache.get(scripthash(1)).is_some()); // 2 is now the oldest
+        cache.put(scripthash(3), cached(4));
+        assert!(cache.get(scripthash(2)).is_none());
+        assert!(cache.get(scripthash(1)).is_some());
+        assert!(cache.get(scripthash(3)).is_some());
+        assert_eq!(cache.refs, 8);
+
+        // replacing an entry swaps its size rather than adding to it
+        cache.put(scripthash(1), cached(6));
+        assert_eq!(cache.refs, 10);
+
+        // larger than the whole cache: dropped, and nothing else is evicted
+        cache.put(scripthash(4), cached(11));
+        assert!(cache.get(scripthash(4)).is_none());
+        assert_eq!(cache.refs, 10);
+    }
 }
