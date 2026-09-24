@@ -43,7 +43,7 @@ pub enum Error {
     Worker,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HeaderNotification {
     pub height: usize,
     pub hex: String,
@@ -92,6 +92,25 @@ pub struct ConfirmedScripthash {
     pub history: Vec<ConfirmedTx>,
     pub utxos: Vec<ConfirmedUtxo>,
 }
+
+impl ConfirmedScripthash {
+    /// The unspent outputs as outpoints, for finding their mempool spenders.
+    pub fn utxo_outpoints(&self) -> Vec<OutPoint> {
+        self.utxos
+            .iter()
+            .filter_map(|utxo| {
+                Some(OutPoint {
+                    txid: utxo.tx_hash.parse().ok()?,
+                    vout: utxo.tx_pos,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Where a script's candidate transactions sit: height, block hash and
+/// position in the block. Taken from the index alone.
+pub type ScriptLocations = Vec<(usize, bitcoin::BlockHash, u32)>;
 
 /// Bodies fetched (and deadline-checked) per round.
 const FETCH_BATCH: usize = 512;
@@ -307,6 +326,34 @@ impl ChainAdapter {
         scripthash: ElectrumScripthash,
     ) -> Result<Vec<ConfirmedTx>, Error> {
         Ok(self.confirmed_scripthash(scripthash)?.history)
+    }
+
+    /// The positions of a script's candidate transactions, from the index
+    /// alone: no bodies are fetched, and prefix false positives are included.
+    /// Two equal results mean the confirmed history cannot have changed,
+    /// which makes this cheap enough to run for every subscription on every
+    /// new block.
+    pub fn scripthash_locations(
+        &self,
+        scripthash: ElectrumScripthash,
+    ) -> Result<ScriptLocations, Error> {
+        let chain = self.chain.read().map_err(|_| Error::Lock)?;
+        let bindex_hash = scripthash
+            .to_bindex()
+            .map_err(|_| Error::InvalidScripthash)?;
+        let mut locations = chain
+            .locations_by_scripthash(&bindex_hash, None)?
+            .map(|location| {
+                (
+                    location.block_height(),
+                    location.block_hash(),
+                    location.block_position(),
+                )
+            })
+            .collect::<Vec<_>>();
+        locations.sort();
+        locations.dedup();
+        Ok(locations)
     }
 
     pub fn confirmed_scripthash(

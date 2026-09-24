@@ -22,10 +22,10 @@ Notes specific to this backend:
   which bindex already requires: `/rest/block/notxdetails` for block metadata
   and txids, `/rest/spenttxouts` for a whole block's prevouts in one request,
   `/rest/tx` for mempool bodies.
-* The mempool index is filled by a poller that starts only when `--http-addr`
-  is set. It fetches the body of each new transaction once (a full mainnet
-  mempool takes a few seconds) and never resolves a prevout: an input is
-  attributed to a script by looking its outpoint up in that script's UTXO set.
+* The mempool index, shared with the Electrum methods, is filled by a poller. It
+  fetches the body of each new transaction once (a full mainnet mempool takes a
+  few seconds) and never resolves a prevout: an input is attributed to a script
+  by looking its outpoint up in that script's UTXO set.
 * `/tx/:txid/outspend*` has no index behind it — the `spending` column family is
   never written — so the spender is found by scanning the funding script's index
   rows from the funding block on. That is cheap for a normal address and

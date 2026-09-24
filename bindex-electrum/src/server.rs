@@ -12,13 +12,14 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpListener,
+    sync::watch,
     time::{self, MissedTickBehavior},
 };
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
     bitcoind::RpcClient,
-    chain::ChainAdapter,
+    chain::{ChainAdapter, HeaderNotification},
     config::{BroadcastVia, Config},
     mempool::MempoolIndex,
     merkle,
@@ -28,7 +29,7 @@ use crate::{
         serialize_responses, server_features, string_param, ElectrumScripthash,
         Error as ProtocolError, Frame, Params, ProtocolVersion, Request, Response,
     },
-    session::Session,
+    session::{ScriptState, Session},
     tls,
     torpush::{self, PushTarget},
     zmq::{self, Wakeups},
@@ -47,6 +48,16 @@ struct State {
     tor_push: Option<TorPush>,
     monitor: Monitor,
     wake: Wakeups,
+    changes: watch::Sender<Changes>,
+}
+
+/// What subscribed sessions are told about: the tip, and a counter bumped
+/// whenever the mempool poll adds or removes transactions. Sessions compare
+/// against what they last saw, so skipped intermediate values lose nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Changes {
+    tip: Option<HeaderNotification>,
+    mempool: u64,
 }
 
 /// Both onion endpoints, resolved once at startup so a package push can never
@@ -76,6 +87,10 @@ impl Server {
 
     pub fn new(config: Config) -> anyhow::Result<Self> {
         let chain = ChainAdapter::open(&config).context("open bindex chain")?;
+        let (changes, _) = watch::channel(Changes {
+            tip: chain.tip().context("read the index tip")?,
+            mempool: 0,
+        });
         let monitor = Monitor::new(config.monitor_path()).context("open electrum monitor")?;
         let bitcoind = RpcClient::new(
             config.bitcoind_rpc_url.clone(),
@@ -111,6 +126,7 @@ impl Server {
                 tor_push,
                 monitor,
                 wake: Wakeups::default(),
+                changes,
             }),
         })
     }
@@ -168,6 +184,7 @@ impl Server {
                 match tokio::task::spawn_blocking(move || chain.refresh()).await {
                     Ok(Ok(elapsed)) => {
                         log::debug!("refreshed electrum secondary in {:.1?}", elapsed);
+                        server.publish_tip();
                     }
                     Ok(Err(err)) => log::warn!("electrum secondary refresh failed: {err}"),
                     Err(err) => log::warn!("electrum secondary refresh task failed: {err}"),
@@ -177,15 +194,9 @@ impl Server {
     }
 
     /// Keep the mempool index in step with the node, every `--mempool-poll-secs`
-    /// or sooner when ZMQ announces a transaction or block.
-    ///
-    /// Only started when the REST API is enabled: the Electrum methods work
-    /// without it (they answer from the chain index), while every REST route
-    /// that mentions unconfirmed transactions needs it.
+    /// or sooner when ZMQ announces a transaction or block. Both the Electrum
+    /// methods and the REST API read unconfirmed transactions from it.
     pub fn spawn_mempool_poll_task(&self) {
-        if self.state.config.rest.http_addr.is_none() {
-            return;
-        }
         let core = crate::rest::rest_core(self, self.state.config.bitcoind_rest_url.clone());
         let interval = self.state.config.mempool_poll_interval();
         let recent_cap = self.state.config.rest.mempool_recent_txs_size;
@@ -210,6 +221,10 @@ impl Server {
                 match polled {
                     Ok(Ok((added, removed, elapsed))) => {
                         if added > 0 || removed > 0 {
+                            server
+                                .state
+                                .changes
+                                .send_modify(|changes| changes.mempool += 1);
                             log::debug!(
                                 "mempool: +{added} -{removed} in {:.1?} ({} txs)",
                                 elapsed,
@@ -240,6 +255,24 @@ impl Server {
                 server.state.wake.mempool.notify_one()
             }));
         }
+    }
+
+    /// Tell subscribed sessions about a new tip, if the refresh found one.
+    fn publish_tip(&self) {
+        let tip = match self.state.chain.tip() {
+            Ok(tip) => tip,
+            Err(err) => {
+                log::warn!("read the index tip: {err}");
+                return;
+            }
+        };
+        self.state.changes.send_if_modified(|changes| {
+            if changes.tip == tip {
+                return false;
+            }
+            changes.tip = tip;
+            true
+        });
     }
 
     /// A block changes both the chain and the mempool. The mempool poll can run
@@ -319,71 +352,94 @@ impl Server {
         let peer = peer.to_string();
         let _session_guard = self.state.monitor.session(peer.clone());
 
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let response = match parse_line(line.as_bytes()) {
-                Ok(Frame::Single(request)) => {
-                    if request.id.is_none() {
-                        self.handle_tracked_request(&mut session, request, &peer)
-                            .await?;
-                        None
-                    } else {
-                        let response = self
-                            .handle_tracked_request(&mut session, request, &peer)
-                            .await?;
-                        Some(serialize_response(&response)?)
+        let mut changes = self.state.changes.subscribe();
+        session.checked_tip = changes.borrow_and_update().tip.clone();
+
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line? else { break };
+                    if let Some(response) = self.handle_line(&mut session, &line, &peer).await? {
+                        writer.write_all(&response).await?;
                     }
                 }
-                Ok(Frame::Batch(requests)) => {
-                    if requests.len() > self.state.config.max_batch_size {
-                        self.state.monitor.record_request(
-                            &peer,
-                            "batch",
-                            false,
-                            Instant::now().elapsed(),
-                            Some("batch too large".to_string()),
-                        );
-                        Some(serialize_response(&Response::error(
-                            None,
-                            -32600,
-                            "batch too large",
-                        ))?)
-                    } else {
-                        let mut responses = Vec::new();
-                        for request in requests {
-                            if request.id.is_some() {
-                                responses.push(
-                                    self.handle_tracked_request(&mut session, request, &peer)
-                                        .await?,
-                                );
-                            } else {
-                                self.handle_tracked_request(&mut session, request, &peer)
-                                    .await?;
-                            }
-                        }
-                        Some(serialize_responses(&responses)?)
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        // the server is shutting down
+                        break;
+                    }
+                    let current = changes.borrow_and_update().clone();
+                    for notification in self.notifications(&mut session, &current) {
+                        writer.write_all(&notification).await?;
                     }
                 }
-                Err(err) => {
-                    let message = err.to_string();
-                    self.state.monitor.record_request(
-                        &peer,
-                        "parse_error",
-                        false,
-                        Instant::now().elapsed(),
-                        Some(message),
-                    );
-                    Some(serialize_response(&Response::from_error(None, err))?)
-                }
-            };
-            if let Some(response) = response {
-                writer.write_all(&response).await?;
             }
         }
         log::debug!("peer {peer} disconnected");
         Ok(())
+    }
+
+    /// Answer one line: a request, a notification-style request (no id) or a
+    /// batch. `None` when there is nothing to send back.
+    async fn handle_line(
+        &self,
+        session: &mut Session,
+        line: &str,
+        peer: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        if line.trim().is_empty() {
+            return Ok(None);
+        }
+        let response = match parse_line(line.as_bytes()) {
+            Ok(Frame::Single(request)) => {
+                if request.id.is_none() {
+                    self.handle_tracked_request(session, request, peer).await?;
+                    None
+                } else {
+                    let response = self.handle_tracked_request(session, request, peer).await?;
+                    Some(serialize_response(&response)?)
+                }
+            }
+            Ok(Frame::Batch(requests)) => {
+                if requests.len() > self.state.config.max_batch_size {
+                    self.state.monitor.record_request(
+                        peer,
+                        "batch",
+                        false,
+                        Instant::now().elapsed(),
+                        Some("batch too large".to_string()),
+                    );
+                    Some(serialize_response(&Response::error(
+                        None,
+                        -32600,
+                        "batch too large",
+                    ))?)
+                } else {
+                    let mut responses = Vec::new();
+                    for request in requests {
+                        if request.id.is_some() {
+                            responses
+                                .push(self.handle_tracked_request(session, request, peer).await?);
+                        } else {
+                            self.handle_tracked_request(session, request, peer).await?;
+                        }
+                    }
+                    Some(serialize_responses(&responses)?)
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.state.monitor.record_request(
+                    peer,
+                    "parse_error",
+                    false,
+                    Instant::now().elapsed(),
+                    Some(message),
+                );
+                Some(serialize_response(&Response::from_error(None, err))?)
+            }
+        };
+        Ok(response)
     }
 
     async fn handle_tracked_request(
@@ -456,13 +512,15 @@ impl Server {
                 Ok(json!(false))
             }
             "blockchain.headers.subscribe" => {
-                session.header_subscribed = true;
-                self.state
+                let tip = self
+                    .state
                     .chain
                     .tip()
                     .map_err(|err| ProtocolError::Server(err.to_string()))?
-                    .map(|tip| serde_json::to_value(tip).unwrap())
-                    .ok_or_else(|| ProtocolError::Server("chain has no headers".to_string()))
+                    .ok_or_else(|| ProtocolError::Server("chain has no headers".to_string()))?;
+                session.header_subscribed = true;
+                session.last_header = Some(tip.clone());
+                Ok(serde_json::to_value(tip).unwrap())
             }
             "blockchain.block.header" => {
                 let height = integer_param(&request.params, 0, "height")? as usize;
@@ -491,8 +549,8 @@ impl Server {
                 self.scripthash_subscribe(session, &request.params)
             }
             "blockchain.scripthash.unsubscribe" => {
-                let sh = string_param(&request.params, 0, "scripthash")?;
-                Ok(json!(session.scripthash_status.remove(&sh).is_some()))
+                let scripthash = parse_scripthash(&request.params)?;
+                Ok(json!(session.scripthashes.remove(&scripthash).is_some()))
             }
             "blockchain.transaction.get" => self.transaction_get(&request.params),
             "blockchain.transaction.broadcast" => {
@@ -654,21 +712,9 @@ impl Server {
             .chain
             .confirmed_scripthash(scripthash)
             .map_err(|err| ProtocolError::Server(err.to_string()))?;
-        let mut history = confirmed
-            .history
-            .into_iter()
-            .map(|tx| crate::protocol::HistoryEntry {
-                tx_hash: tx.tx_hash,
-                height: tx.height as i64,
-                fee: None,
-            })
-            .collect::<Vec<_>>();
-        let mut mempool = self
-            .state
-            .mempool
-            .read()
-            .unwrap()
-            .history_entries(scripthash);
+        let utxos = confirmed.utxo_outpoints();
+        let mut history = confirmed_history(confirmed.history);
+        let mut mempool = self.unconfirmed_history(scripthash, &history, &utxos);
         history.append(&mut mempool);
         Ok(json!(history))
     }
@@ -707,14 +753,32 @@ impl Server {
             .collect::<Vec<_>>()))
     }
 
+    /// Unconfirmed transactions paying or spending from the script. Finding the
+    /// spends of its confirmed outputs needs its confirmed state, so this costs
+    /// what `get_history` costs.
     fn scripthash_mempool(&self, params: &Params) -> Result<Value, ProtocolError> {
         let scripthash = parse_scripthash(params)?;
+        let confirmed = self
+            .state
+            .chain
+            .confirmed_scripthash(scripthash)
+            .map_err(|err| ProtocolError::Server(err.to_string()))?;
+        let utxos = confirmed.utxo_outpoints();
+        // as in unconfirmed_history: skip what the index already has as mined
+        let mined = confirmed
+            .history
+            .iter()
+            .map(|tx| tx.tx_hash.as_str())
+            .collect::<std::collections::HashSet<_>>();
         Ok(json!(self
             .state
             .mempool
             .read()
             .unwrap()
-            .entries(scripthash)))
+            .script_entries(scripthash, &utxos)
+            .into_iter()
+            .filter(|entry| !mined.contains(entry.tx_hash.as_str()))
+            .collect::<Vec<_>>()))
     }
 
     fn scripthash_subscribe(
@@ -722,38 +786,116 @@ impl Server {
         session: &mut Session,
         params: &Params,
     ) -> Result<Value, ProtocolError> {
-        if session.scripthash_status.len() >= self.state.config.max_subscriptions_per_session {
+        let scripthash = parse_scripthash(params)?;
+        if !session.scripthashes.contains_key(&scripthash)
+            && session.scripthashes.len() >= self.state.config.max_subscriptions_per_session
+        {
             return Err(ProtocolError::Server(
                 "subscription limit exceeded".to_string(),
             ));
         }
-        let scripthash = parse_scripthash(params)?;
-        let confirmed = self
-            .state
-            .chain
-            .confirmed_scripthash(scripthash)
+        let mut state = self
+            .script_state(scripthash)
             .map_err(|err| ProtocolError::Server(err.to_string()))?;
-        let mut full_history = confirmed
-            .history
-            .into_iter()
-            .map(|tx| crate::protocol::HistoryEntry {
-                tx_hash: tx.tx_hash,
-                height: tx.height as i64,
-                fee: None,
-            })
-            .collect::<Vec<_>>();
-        full_history.extend(
-            self.state
-                .mempool
-                .read()
-                .unwrap()
-                .history_entries(scripthash),
-        );
-        let status = scripthash_status(&full_history);
-        session
-            .scripthash_status
-            .insert(scripthash.to_string(), status.clone());
+        state.status = self.script_status(scripthash, &state);
+        let status = state.status.clone();
+        session.scripthashes.insert(scripthash, state);
         Ok(json!(status))
+    }
+
+    /// A script's confirmed state, as a session keeps it for a subscription.
+    /// The locations are read first: if the chain moves in between, they are
+    /// older than the history, and the next tip change rebuilds the state.
+    fn script_state(
+        &self,
+        scripthash: ElectrumScripthash,
+    ) -> Result<ScriptState, crate::chain::Error> {
+        let locations = self.state.chain.scripthash_locations(scripthash)?;
+        let confirmed = self.state.chain.confirmed_scripthash(scripthash)?;
+        Ok(ScriptState {
+            locations,
+            utxos: confirmed.utxo_outpoints(),
+            confirmed: confirmed_history(confirmed.history),
+            status: None,
+        })
+    }
+
+    /// The script's status from its confirmed state and the current mempool.
+    fn script_status(&self, scripthash: ElectrumScripthash, state: &ScriptState) -> Option<String> {
+        let mut history = state.confirmed.clone();
+        history.extend(self.unconfirmed_history(scripthash, &state.confirmed, &state.utxos));
+        scripthash_status(&history)
+    }
+
+    /// The script's mempool entries, minus any the index already has as
+    /// confirmed: between an index refresh and the next mempool poll, a newly
+    /// mined transaction is in both.
+    fn unconfirmed_history(
+        &self,
+        scripthash: ElectrumScripthash,
+        confirmed: &[crate::protocol::HistoryEntry],
+        utxos: &[bitcoin::OutPoint],
+    ) -> Vec<crate::protocol::HistoryEntry> {
+        let confirmed = confirmed
+            .iter()
+            .map(|entry| entry.tx_hash.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.state
+            .mempool
+            .read()
+            .unwrap()
+            .script_history_entries(scripthash, utxos)
+            .into_iter()
+            .filter(|entry| !confirmed.contains(entry.tx_hash.as_str()))
+            .collect()
+    }
+
+    /// The notifications a session is owed after the tip or mempool changed:
+    /// the new tip if it subscribed to headers, and every subscribed script
+    /// whose status differs from the one it was last sent.
+    fn notifications(&self, session: &mut Session, changes: &Changes) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        if session.header_subscribed && changes.tip != session.last_header {
+            if let Some(tip) = &changes.tip {
+                out.push(notification("blockchain.headers.subscribe", json!([tip])));
+                session.last_header = Some(tip.clone());
+            }
+        }
+
+        let tip_changed = changes.tip != session.checked_tip;
+        for (scripthash, state) in session.scripthashes.iter_mut() {
+            if tip_changed {
+                // one index scan; fetch bodies only if the script's rows moved
+                match self.state.chain.scripthash_locations(*scripthash) {
+                    Ok(locations) if locations == state.locations => {}
+                    Ok(_) => match self.script_state(*scripthash) {
+                        Ok(fresh) => {
+                            let sent = state.status.take();
+                            *state = fresh;
+                            state.status = sent;
+                        }
+                        Err(err) => {
+                            log::warn!("refresh subscription {scripthash}: {err}");
+                            continue;
+                        }
+                    },
+                    Err(err) => {
+                        log::warn!("check subscription {scripthash}: {err}");
+                        continue;
+                    }
+                }
+            }
+            let status = self.script_status(*scripthash, state);
+            if status != state.status {
+                out.push(notification(
+                    "blockchain.scripthash.subscribe",
+                    json!([scripthash.to_string(), status]),
+                ));
+                state.status = status;
+            }
+        }
+        session.checked_tip = changes.tip.clone();
+        out
     }
 
     fn transaction_get(&self, params: &Params) -> Result<Value, ProtocolError> {
@@ -817,6 +959,31 @@ impl Server {
             Ok(json!(txid.to_string()))
         }
     }
+}
+
+/// A server-to-client notification: a request with no id.
+fn notification(method: &str, params: Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    }))
+    .expect("notification serializes");
+    bytes.push(b'\n');
+    bytes
+}
+
+fn confirmed_history(
+    history: Vec<crate::chain::ConfirmedTx>,
+) -> Vec<crate::protocol::HistoryEntry> {
+    history
+        .into_iter()
+        .map(|tx| crate::protocol::HistoryEntry {
+            tx_hash: tx.tx_hash,
+            height: tx.height as i64,
+            fee: None,
+        })
+        .collect()
 }
 
 fn merkle_value(height: usize, txids: &[Txid], pos: usize) -> Value {

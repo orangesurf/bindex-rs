@@ -88,7 +88,7 @@ pub struct Config {
 
     /// The node's `zmqpubrawtx` endpoint (e.g. `tcp://127.0.0.1:28333`). Each
     /// announced transaction wakes the mempool poll early, at most once a
-    /// second. Needs `--http-addr`, which is what starts the mempool poll.
+    /// second.
     #[arg(long)]
     pub zmq_rawtx: Option<String>,
 
@@ -322,9 +322,6 @@ impl Config {
                     anyhow::bail!("{flag} must be a tcp:// endpoint, got {endpoint}");
                 }
             }
-        }
-        if self.zmq_rawtx.is_some() && self.rest.http_addr.is_none() {
-            anyhow::bail!("zmq-rawtx needs --http-addr: it wakes the REST mempool poll");
         }
         if self.rest.http_addr.is_some() {
             // the REST shapes need to know the chain the index is of

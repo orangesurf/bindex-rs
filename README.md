@@ -67,8 +67,13 @@ each candidate is fetched and checked. Bitcoin Core 31 or later is required, wit
 - **Protocol 1.4 to 1.6:** ![new][new] negotiated per connection, including
   1.6's header arrays, `mempool.get_info` and canonical mempool ordering.
 - **Full method set:** ![new][new] headers with checkpoint proofs, script-hash
-  history, balance, UTXOs and mempool, subscriptions, transaction and Merkle-proof
-  lookups, fee estimates and fee histograms.
+  history, balance, UTXOs and mempool, transaction and Merkle-proof lookups, fee
+  estimates and fee histograms.
+- **Subscriptions:** ![new][new] header subscribers are sent each new tip, and
+  script subscribers each new status, whether a block or a mempool transaction
+  changed it. A mempool change costs no node requests; a new block costs one
+  index scan per subscribed script, and a full history fetch only for scripts
+  the block touched.
 - **Package broadcast:** ![new][new] `blockchain.transaction.broadcast_package`
   submits related transactions together, as Core's `submitpackage` does.
 - **Tor broadcast:** ![new][new] by default on Bitcoin, every transaction goes
@@ -79,12 +84,12 @@ each candidate is fetched and checked. Bitcoin Core 31 or later is required, wit
   limits on batch size and subscriptions.
 - **ZMQ wake-ups:** ![new][new] with `--zmq-rawblock`, an announced block makes
   the server pick up the new tip as soon as the writer has indexed it (it retries
-  for 10 seconds), instead of on the 30-second timer. With `--zmq-rawtx`, an announced transaction starts the
-  REST API's mempool poll at once, at most once a second, instead of every 5
-  seconds. The timers stay as the fallback, because ZMQ can drop messages.
-- **History cache and monitor:** ![new][new] script histories and statuses are
-  cached in SQLite, and request latencies are written to a JSON file for the
-  monitor page.
+  for 10 seconds), instead of on the 30-second timer. With `--zmq-rawtx`, an
+  announced transaction starts the mempool poll at once, at most once a second,
+  instead of every 5 seconds. The timers stay as the fallback, because ZMQ can
+  drop messages.
+- **Monitor:** ![new][new] request counts and latencies are written to a JSON
+  file, which `bindex-web`'s monitor page reads.
 
 The server follows the index as a read-only secondary, so it needs a writer:
 `bindex-sync` or `bindex-web`. It checks for newly indexed blocks every 30 seconds

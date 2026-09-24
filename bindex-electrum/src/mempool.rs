@@ -121,6 +121,75 @@ impl MempoolIndex {
             .collect()
     }
 
+    /// The mempool transactions in a script's history: those paying it, and
+    /// those spending one of its outputs. Spends of confirmed outputs are found
+    /// through `confirmed_outputs`, the script's confirmed unspent outputs,
+    /// because the poller records only which scripts a transaction pays.
+    pub fn script_txids(
+        &self,
+        scripthash: ElectrumScripthash,
+        confirmed_outputs: &[OutPoint],
+    ) -> BTreeSet<Txid> {
+        let mut txids = self
+            .by_scripthash
+            .get(&scripthash)
+            .cloned()
+            .unwrap_or_default();
+        let unconfirmed_outputs = txids
+            .iter()
+            .filter_map(|txid| self.txs.get(txid))
+            .flat_map(|tx| {
+                tx.outputs
+                    .iter()
+                    .filter(|(_, (output_scripthash, _))| *output_scripthash == scripthash)
+                    .map(|(vout, _)| OutPoint {
+                        txid: tx.txid,
+                        vout: *vout,
+                    })
+            })
+            .collect::<Vec<_>>();
+        for outpoint in confirmed_outputs.iter().chain(&unconfirmed_outputs) {
+            if let Some(spender) = self.spent_prevouts.get(outpoint) {
+                txids.insert(*spender);
+            }
+        }
+        txids
+    }
+
+    /// [`Self::script_txids`] as `get_mempool` entries, in txid order.
+    pub fn script_entries(
+        &self,
+        scripthash: ElectrumScripthash,
+        confirmed_outputs: &[OutPoint],
+    ) -> Vec<MempoolEntry> {
+        self.script_txids(scripthash, confirmed_outputs)
+            .iter()
+            .filter_map(|txid| self.txs.get(txid))
+            .map(|tx| MempoolEntry {
+                tx_hash: tx.txid.to_string(),
+                height: 0,
+                fee: tx.fee,
+            })
+            .collect()
+    }
+
+    /// [`Self::script_entries`] as history entries, for `get_history` and the
+    /// script's status.
+    pub fn script_history_entries(
+        &self,
+        scripthash: ElectrumScripthash,
+        confirmed_outputs: &[OutPoint],
+    ) -> Vec<HistoryEntry> {
+        self.script_entries(scripthash, confirmed_outputs)
+            .into_iter()
+            .map(|entry| HistoryEntry {
+                tx_hash: entry.tx_hash,
+                height: entry.height,
+                fee: Some(entry.fee),
+            })
+            .collect()
+    }
+
     pub fn history_entries(&self, scripthash: ElectrumScripthash) -> Vec<HistoryEntry> {
         self.entries(scripthash)
             .into_iter()
@@ -445,6 +514,63 @@ mod tests {
         assert_eq!(index.entries(sh).len(), 1);
         assert!(index.remove(&txid).is_some());
         assert!(index.entries(sh).is_empty());
+    }
+
+    /// A script's mempool history holds what pays it and what spends its
+    /// outputs, confirmed or not; the poller records only the payments.
+    #[test]
+    fn script_txids_include_spends_of_confirmed_and_unconfirmed_outputs() {
+        let sh = ElectrumScripthash::parse(&"22".repeat(32)).unwrap();
+        let other = ElectrumScripthash::parse(&"33".repeat(32)).unwrap();
+        let txid = |name: &[u8]| Txid::from_raw_hash(sha256d::Hash::hash(name));
+        let tx = |id: Txid, spends: &[OutPoint], pays: &[ElectrumScripthash]| MempoolTx {
+            txid: id,
+            raw: Vec::new(),
+            fee: 100,
+            vsize: 50,
+            ancestor_fees: 100,
+            ancestor_vsize: 50,
+            time: 0,
+            touches: pays.iter().copied().collect(),
+            spends: spends.iter().copied().collect(),
+            outputs: pays
+                .iter()
+                .enumerate()
+                .map(|(vout, sh)| (vout as u32, (*sh, 1_000)))
+                .collect(),
+        };
+        let confirmed = OutPoint {
+            txid: txid(b"confirmed funding"),
+            vout: 0,
+        };
+        let (pays_it, spends_confirmed, spends_unconfirmed, unrelated) = (
+            txid(b"pays"),
+            txid(b"spends confirmed"),
+            txid(b"spends unconfirmed"),
+            txid(b"unrelated"),
+        );
+        let mut index = MempoolIndex::default();
+        index.insert(tx(pays_it, &[], &[sh]));
+        index.insert(tx(spends_confirmed, &[confirmed], &[other]));
+        index.insert(tx(
+            spends_unconfirmed,
+            &[OutPoint {
+                txid: pays_it,
+                vout: 0,
+            }],
+            &[other],
+        ));
+        index.insert(tx(unrelated, &[], &[other]));
+
+        let expected: BTreeSet<Txid> = [pays_it, spends_confirmed, spends_unconfirmed]
+            .into_iter()
+            .collect();
+        assert_eq!(index.script_txids(sh, &[confirmed]), expected);
+        // without the confirmed outputs, their spenders cannot be found
+        assert_eq!(
+            index.script_txids(sh, &[]),
+            [pays_it, spends_unconfirmed].into_iter().collect()
+        );
     }
 
     #[test]
