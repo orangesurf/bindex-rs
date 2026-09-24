@@ -86,9 +86,15 @@ pub struct Config {
     #[arg(long, default_value_t = 30_000)]
     pub secondary_refresh_ms: u64,
 
+    /// The node's `zmqpubrawtx` endpoint (e.g. `tcp://127.0.0.1:28333`). Each
+    /// announced transaction wakes the mempool poll early, at most once a
+    /// second. Needs `--http-addr`, which is what starts the mempool poll.
     #[arg(long)]
     pub zmq_rawtx: Option<String>,
 
+    /// The node's `zmqpubrawblock` endpoint (e.g. `tcp://127.0.0.1:28332`). Each
+    /// announced block wakes the index refresh (retried for ten seconds while
+    /// the writer catches up) and the mempool poll early.
     #[arg(long)]
     pub zmq_rawblock: Option<String>,
 
@@ -306,6 +312,19 @@ impl Config {
         }
         if self.secondary_refresh_ms == 0 {
             anyhow::bail!("secondary-refresh-ms must be positive");
+        }
+        for (flag, endpoint) in [
+            ("zmq-rawtx", &self.zmq_rawtx),
+            ("zmq-rawblock", &self.zmq_rawblock),
+        ] {
+            if let Some(endpoint) = endpoint {
+                if !endpoint.starts_with("tcp://") {
+                    anyhow::bail!("{flag} must be a tcp:// endpoint, got {endpoint}");
+                }
+            }
+        }
+        if self.zmq_rawtx.is_some() && self.rest.http_addr.is_none() {
+            anyhow::bail!("zmq-rawtx needs --http-addr: it wakes the REST mempool poll");
         }
         if self.rest.http_addr.is_some() {
             // the REST shapes need to know the chain the index is of

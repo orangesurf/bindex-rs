@@ -77,12 +77,18 @@ each candidate is fetched and checked. Bitcoin Core 31 or later is required, wit
   mempool.space; `--broadcast-via bitcoind` uses your node instead.
 - **Transports:** ![new][new] TCP and TLS, JSON-RPC batching, and per-session
   limits on batch size and subscriptions.
+- **ZMQ wake-ups:** ![new][new] with `--zmq-rawblock`, an announced block makes
+  the server pick up the new tip as soon as the writer has indexed it (it retries
+  for 10 seconds), instead of on the 30-second timer. With `--zmq-rawtx`, an announced transaction starts the
+  REST API's mempool poll at once, at most once a second, instead of every 5
+  seconds. The timers stay as the fallback, because ZMQ can drop messages.
 - **History cache and monitor:** ![new][new] script histories and statuses are
   cached in SQLite, and request latencies are written to a JSON file for the
   monitor page.
 
 The server follows the index as a read-only secondary, so it needs a writer:
-`bindex-sync` or `bindex-web`. It polls the node's mempool every 5 seconds.
+`bindex-sync` or `bindex-web`. It checks for newly indexed blocks every 30 seconds
+by default.
 
 ## Esplora REST API (`bindex-electrum --http-addr`) ![new][new]
 

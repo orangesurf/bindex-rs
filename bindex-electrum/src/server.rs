@@ -31,6 +31,7 @@ use crate::{
     session::Session,
     tls,
     torpush::{self, PushTarget},
+    zmq::{self, Wakeups},
 };
 
 #[derive(Clone)]
@@ -45,6 +46,7 @@ struct State {
     bitcoind: RpcClient,
     tor_push: Option<TorPush>,
     monitor: Monitor,
+    wake: Wakeups,
 }
 
 /// Both onion endpoints, resolved once at startup so a package push can never
@@ -108,6 +110,7 @@ impl Server {
                 bitcoind,
                 tor_push,
                 monitor,
+                wake: Wakeups::default(),
             }),
         })
     }
@@ -115,6 +118,7 @@ impl Server {
     pub async fn run(self) -> anyhow::Result<()> {
         self.spawn_secondary_refresh_task();
         self.spawn_mempool_poll_task();
+        self.spawn_zmq_tasks();
 
         if let Some(addr) = self.state.config.rest.http_addr {
             let server = self.clone();
@@ -146,15 +150,20 @@ impl Server {
             .await
     }
 
-    fn spawn_secondary_refresh_task(&self) {
+    /// Follow the writer: refresh the secondary every `--secondary-refresh-ms`,
+    /// or sooner when a ZMQ block announcement asks for it.
+    pub fn spawn_secondary_refresh_task(&self) {
         let chain = self.state.chain.clone();
         let interval = chain.refresh_interval();
+        let server = self.clone();
         tokio::spawn(async move {
-            time::sleep(interval).await;
-            let mut ticker = time::interval(interval);
+            let mut ticker = time::interval_at(time::Instant::now() + interval, interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = server.state.wake.refresh.notified() => {}
+                }
                 let chain = chain.clone();
                 match tokio::task::spawn_blocking(move || chain.refresh()).await {
                     Ok(Ok(elapsed)) => {
@@ -167,7 +176,8 @@ impl Server {
         });
     }
 
-    /// Keep the mempool index in step with the node.
+    /// Keep the mempool index in step with the node, every `--mempool-poll-secs`
+    /// or sooner when ZMQ announces a transaction or block.
     ///
     /// Only started when the REST API is enabled: the Electrum methods work
     /// without it (they answer from the chain index), while every REST route
@@ -184,7 +194,11 @@ impl Server {
             let mut ticker = time::interval(interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = server.state.wake.mempool.notified() => {}
+                }
+                let started = time::Instant::now();
                 let core = core.clone();
                 let worker = server.clone();
                 let polled = tokio::task::spawn_blocking(move || {
@@ -206,6 +220,39 @@ impl Server {
                     Ok(Err(err)) => log::warn!("mempool poll failed: {err}"),
                     Err(err) => log::warn!("mempool poll task failed: {err}"),
                 }
+                time::sleep_until(started + zmq::MIN_MEMPOOL_POLL_GAP).await;
+            }
+        });
+    }
+
+    /// Subscribe to the node's ZMQ announcements, if configured. They only wake
+    /// the refresh and mempool tasks early; see [`crate::zmq`].
+    pub fn spawn_zmq_tasks(&self) {
+        if let Some(endpoint) = self.state.config.zmq_rawblock.clone() {
+            let server = self.clone();
+            tokio::spawn(zmq::subscribe(endpoint, "rawblock", move || {
+                server.block_announced()
+            }));
+        }
+        if let Some(endpoint) = self.state.config.zmq_rawtx.clone() {
+            let server = self.clone();
+            tokio::spawn(zmq::subscribe(endpoint, "rawtx", move || {
+                server.state.wake.mempool.notify_one()
+            }));
+        }
+    }
+
+    /// A block changes both the chain and the mempool. The mempool poll can run
+    /// at once; the index refresh is retried on a schedule, because the writer
+    /// may not have indexed the block yet.
+    fn block_announced(&self) {
+        self.state.wake.mempool.notify_one();
+        let server = self.clone();
+        tokio::spawn(async move {
+            let announced = time::Instant::now();
+            for offset in zmq::BLOCK_REFRESH_OFFSETS {
+                time::sleep_until(announced + offset).await;
+                server.state.wake.refresh.notify_one();
             }
         });
     }

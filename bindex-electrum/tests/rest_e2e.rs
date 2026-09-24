@@ -882,3 +882,148 @@ async fn tor_mode_refuses_local_submission_and_the_utxo_cap_is_historical(
     rest_task.abort();
     Ok(())
 }
+
+/// With both timers set to ten minutes, only the node's ZMQ announcements can
+/// make a new transaction or block show up within seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zmq_announcements_wake_the_refresh_and_the_mempool_poll() -> anyhow::Result<()> {
+    let bitcoind = match exe_path() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("skipping ZMQ E2E test: BITCOIND_EXE is not set or invalid: {err}");
+            return Ok(());
+        }
+    };
+
+    let block_endpoint = format!("tcp://127.0.0.1:{}", free_port()?);
+    let tx_endpoint = format!("tcp://127.0.0.1:{}", free_port()?);
+    let block_arg = format!("-zmqpubrawblock={block_endpoint}");
+    let tx_arg = format!("-zmqpubrawtx={tx_endpoint}");
+    let mut conf = Conf::default();
+    conf.args.push("-rest");
+    conf.args.push(&block_arg);
+    conf.args.push(&tx_arg);
+    let node = Node::with_conf(bitcoind, &conf)?;
+
+    let miner = node.client.new_address()?;
+    node.client.generate_to_address(101, &miner)?;
+
+    // the test is the index writer, and keeps the primary open throughout
+    let db_dir = TempDir::with_prefix("bindex-zmq-db")?;
+    let rest_url = format!("http://{}", node.params.rpc_socket);
+    let mut writer = bindex::IndexedChain::open_with_rest_url(
+        db_dir.path(),
+        Network::Regtest,
+        rest_url.clone(),
+    )?;
+    writer.sync(1000)?;
+
+    let state_dir = TempDir::with_prefix("bindex-zmq-state")?;
+    let config = Config::try_parse_from([
+        "bindex-electrum",
+        "--network",
+        "regtest",
+        "--bindex-db-path",
+        db_dir.path().to_str().context("db path")?,
+        "--bitcoind-rest-url",
+        &rest_url,
+        "--bitcoind-rpc-url",
+        &rest_url,
+        "--bitcoind-rpc-cookie",
+        node.params.cookie_file.to_str().context("cookie path")?,
+        "--tcp-listen",
+        "127.0.0.1:0",
+        "--cache-path",
+        state_dir
+            .path()
+            .join("cache.sqlite3")
+            .to_str()
+            .context("cache")?,
+        "--monitor-path",
+        state_dir
+            .path()
+            .join("monitor.json")
+            .to_str()
+            .context("monitor")?,
+        "--mempool-poll-secs",
+        "600",
+        "--secondary-refresh-ms",
+        "600000",
+        "--broadcast-via",
+        "bitcoind",
+        "--http-addr",
+        "127.0.0.1:0",
+        "--zmq-rawblock",
+        &block_endpoint,
+        "--zmq-rawtx",
+        &tx_endpoint,
+    ])?;
+    config.validate()?;
+
+    let http = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = http.local_addr()?;
+    let server = Server::new(config)?;
+    server.spawn_secondary_refresh_task();
+    server.spawn_mempool_poll_task();
+    server.spawn_zmq_tasks();
+    let rest_task = tokio::spawn(rest::run_listener(RestApi::new(server).unwrap(), http));
+
+    assert_eq!(get_ok(addr, "/blocks/tip/height").await?.body, "101");
+    // A subscriber misses whatever is published before it joins.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let txid = node
+        .client
+        .send_to_address(&external_address(9), Amount::from_sat(40_000))?
+        .txid()
+        .context("send_to_address returned no txid")?;
+    wait_until(
+        Duration::from_secs(10),
+        "the announced transaction",
+        || async {
+            let txids = get_ok(addr, "/mempool/txids").await?.json();
+            Ok(txids
+                .as_array()
+                .is_some_and(|ids| ids.contains(&Value::from(txid.to_string()))))
+        },
+    )
+    .await?;
+
+    node.client.generate_to_address(1, &miner)?;
+    writer.sync(1000)?;
+    wait_until(Duration::from_secs(15), "the announced block", || async {
+        Ok(get_ok(addr, "/blocks/tip/height").await?.body == "102")
+    })
+    .await?;
+    wait_until(
+        Duration::from_secs(10),
+        "the mined transaction to leave the mempool",
+        || async { Ok(get_ok(addr, "/mempool").await?.json()["count"] == 0) },
+    )
+    .await?;
+
+    rest_task.abort();
+    Ok(())
+}
+
+/// A port nothing listens on right now, for the node to publish on.
+fn free_port() -> anyhow::Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port())
+}
+
+async fn wait_until<F, Fut>(limit: Duration, what: &str, mut check: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if check().await? {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("timed out after {limit:?} waiting for {what}")
+}

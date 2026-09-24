@@ -13,3 +13,4 @@ pub mod server;
 pub mod session;
 pub mod tls;
 pub mod torpush;
+pub mod zmq;
