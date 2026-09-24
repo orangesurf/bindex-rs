@@ -150,9 +150,14 @@ impl<'a> Builder<'a> {
 impl IndexedChain {
     /// Open an existing DB, or create if missing.
     /// Use binary format REST API for fetching the data from bitcoind.
-    pub fn open(db_dir: impl AsRef<Path>, network: Network) -> Result<Self, Error> {
+    /// Allow setting REST server URL (e.g. "http://hostname:8332").
+    pub fn open(
+        db_dir: impl AsRef<Path>,
+        network: Network,
+        url: Option<String>,
+    ) -> Result<Self, Error> {
         let db_path = db_dir.as_ref().to_path_buf().join(db_name(network));
-        let url = format!("http://localhost:{}", default_rpc_port(network));
+        let url = url.unwrap_or_else(|| format!("http://localhost:{}", default_rpc_port(network)));
         Self::from_config(Config {
             db_path,
             url,

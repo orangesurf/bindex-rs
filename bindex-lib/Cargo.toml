@@ -1,6 +1,6 @@
 [package]
 name = "bindex"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Roman Zeyde <me@romanzey.de>"]
 description = "Bitcoin indexing library in Rust"
@@ -18,7 +18,7 @@ bitcoin_serde = ["bitcoin/serde"]
 
 [dependencies]
 bitcoin = { version = "0.32", default-features = false }
-bitcoin_slices = { version = "0.11", features = ["bitcoin"] }
+bitcoin_slices = { version = "0.12", features = ["bitcoin"] }
 elements = { version = "0.26", optional = true, default-features = false }
 log = "0.4"
 serde = { version = "1.0", default-features = false, features = ["serde_derive"] }

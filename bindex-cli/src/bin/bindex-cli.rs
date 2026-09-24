@@ -229,7 +229,8 @@ fn run() -> Result<()> {
     let args = Args::parse();
     env_logger::builder().format_timestamp_micros().init();
 
-    let mut chain = IndexedChain::open(&args.db_path, args.network.into())?;
+    // Assume localhost REST server.
+    let mut chain = IndexedChain::open(&args.db_path, args.network.into(), None)?;
     let mut tip = chain.headers().tip_hash();
 
     let cache_db = rusqlite::Connection::open(Path::new(match args.cache_file {

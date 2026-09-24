@@ -228,7 +228,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let chain = IndexedChain::open(DB_PATH, NETWORK).context("open index")?;
+    let chain = IndexedChain::open(DB_PATH, NETWORK, None).context("open index")?;
     let chain: Chain = Arc::new(RwLock::new(chain));
     let metrics: Metrics = Arc::new(Monitor::new());
 
